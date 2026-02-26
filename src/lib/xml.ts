@@ -1,5 +1,3 @@
-import { TranscriptEntry } from "@/lib/types";
-
 function escapeXml(s: string): string {
   return s
     .replace(/&/g, "&amp;")
@@ -55,7 +53,7 @@ function getFrameTimeFormat(fps: number): {
  * - Duration from ffprobe when available; timecodes start at 0.
  */
 export function generateFCPXML(
-  segments: TranscriptEntry[],
+  segments: { start: number; end: number; text: string }[],
   sourceName: string,
   duration: number,
   fps: number = 30

@@ -6,11 +6,11 @@ import {
   TranscriptEntry,
   SegmentGroup,
   LineDecision,
-  EditableSegment,
   EditableWord,
   WordTiming,
 } from "@/lib/types";
 import { generateFCPXML } from "@/lib/xml";
+import { computeFinalClips } from "@/lib/export";
 import FileBrowser from "@/components/file-browser";
 import TranscribeStep from "@/components/transcribe-step";
 import SegmentStep from "@/components/segment-step";
@@ -24,83 +24,106 @@ function normalizeWord(s: string): string {
 }
 
 /**
- * Map each token in `tokens` to a source WordTiming by finding the first
- * contiguous run of source words that matches the token sequence.
- * Falls back to individual greedy matching if no contiguous run is found.
+ * Build a flat array of EditableWords from the transcript and LLM decisions.
+ *
+ * - "remove" utterances: all words marked removed=true
+ * - "keep" utterances: all words marked removed=false
+ * - "trim" utterances: attempt contiguous match of trimmed text against source
+ *   words; if found, mark outside words as removed; on failure keep all.
+ *
+ * If an utterance has no word-level data, timestamps are interpolated
+ * evenly across the utterance duration as a fallback.
  */
-function matchWordsToSource(
-  tokens: string[],
-  sourceWords: WordTiming[]
-): (WordTiming | undefined)[] {
-  if (!sourceWords.length) return tokens.map(() => undefined);
-
-  const normTokens = tokens.map(normalizeWord);
-  const normSource = sourceWords.map((w) => normalizeWord(w.word));
-
-  // Find the starting index in sourceWords where the token sequence begins
-  let startIdx = -1;
-  for (let si = 0; si <= normSource.length - normTokens.length; si++) {
-    if (normSource[si] === normTokens[0]) {
-      let match = true;
-      for (let ti = 1; ti < normTokens.length; ti++) {
-        if (normSource[si + ti] !== normTokens[ti]) {
-          match = false;
-          break;
-        }
-      }
-      if (match) {
-        startIdx = si;
-        break;
-      }
-    }
-  }
-
-  if (startIdx !== -1) {
-    return tokens.map((_, ti) => sourceWords[startIdx + ti]);
-  }
-
-  // Fallback: match each token independently (greedy first-match)
-  return tokens.map((token) => {
-    const norm = normalizeWord(token);
-    return sourceWords.find((w) => normalizeWord(w.word) === norm);
-  });
-}
-
-function buildEditableSegments(
+function buildEditableWords(
   transcript: TranscriptEntry[],
   decisions: LineDecision[]
-): EditableSegment[] {
+): EditableWord[] {
   const decisionMap = new Map(decisions.map((d) => [d.index, d]));
-  return transcript.map((seg, i) => {
-    const decision = decisionMap.get(i);
+  const allWords: EditableWord[] = [];
+
+  transcript.forEach((seg, utteranceIdx) => {
+    const decision = decisionMap.get(utteranceIdx);
     const action = decision?.action ?? "keep";
-    const editedText =
-      action === "trim" && decision?.text ? decision.text : seg.text;
 
-    const sourceWords = seg.words ?? [];
-    const textTokens = editedText.split(/\s+/).filter(Boolean);
+    // Resolve word-level data; synthesize if missing
+    const sourceWords: WordTiming[] =
+      seg.words && seg.words.length > 0
+        ? seg.words
+        : seg.text
+            .split(/\s+/)
+            .filter(Boolean)
+            .map((w, i, arr) => {
+              const d = (seg.end - seg.start) / arr.length;
+              return {
+                word: w,
+                start: seg.start + i * d,
+                end: seg.start + (i + 1) * d,
+              };
+            });
 
-    const matched = matchWordsToSource(textTokens, sourceWords);
-    const words: EditableWord[] = textTokens.map((w, j) => ({
-      id: `${i}-${j}`,
-      text: w,
-      removed: false,
-      start: matched[j]?.start,
-      end: matched[j]?.end,
-      confidence: matched[j]?.confidence,
-      speaker: matched[j]?.speaker,
-    }));
+    // Determine which word indices to mark removed
+    let removedIndices: "all" | "none" | Set<number> = "none";
 
-    return {
-      originalIndex: i,
-      start: seg.start,
-      end: seg.end,
-      originalText: seg.text,
-      editedText,
-      action,
-      words,
-    };
+    if (action === "remove") {
+      removedIndices = "all";
+    } else if (action === "trim" && decision?.text) {
+      const trimTokens = decision.text.split(/\s+/).filter(Boolean).map(normalizeWord);
+      const normSource = sourceWords.map((w) => normalizeWord(w.word));
+
+      // Try to find trimmed tokens as a contiguous subsequence
+      let startIdx = -1;
+      for (let si = 0; si <= normSource.length - trimTokens.length; si++) {
+        if (normSource[si] === trimTokens[0]) {
+          let match = true;
+          for (let ti = 1; ti < trimTokens.length; ti++) {
+            if (normSource[si + ti] !== trimTokens[ti]) {
+              match = false;
+              break;
+            }
+          }
+          if (match) {
+            startIdx = si;
+            break;
+          }
+        }
+      }
+
+      if (startIdx !== -1) {
+        const kept = new Set<number>();
+        for (let ti = 0; ti < trimTokens.length; ti++) {
+          kept.add(startIdx + ti);
+        }
+        const removed = new Set<number>();
+        sourceWords.forEach((_, i) => {
+          if (!kept.has(i)) removed.add(i);
+        });
+        removedIndices = removed;
+      }
+      // else: match failed → keep all (safe fallback)
+    }
+
+    sourceWords.forEach((w, wi) => {
+      const removed =
+        removedIndices === "all"
+          ? true
+          : removedIndices === "none"
+          ? false
+          : removedIndices.has(wi);
+
+      allWords.push({
+        id: `${utteranceIdx}-${wi}`,
+        text: w.word,
+        removed,
+        start: w.start,
+        end: w.end,
+        utteranceIdx,
+        confidence: w.confidence,
+        speaker: w.speaker,
+      });
+    });
   });
+
+  return allWords;
 }
 
 export default function Home() {
@@ -111,9 +134,7 @@ export default function Home() {
   const [duration, setDuration] = useState(0);
   const [fps, setFps] = useState(30);
   const [segments, setSegments] = useState<SegmentGroup[]>([]);
-  const [editableSegments, setEditableSegments] = useState<EditableSegment[]>(
-    []
-  );
+  const [editableWords, setEditableWords] = useState<EditableWord[]>([]);
 
   const handleFileSelected = (path: string, name: string) => {
     setFilePath(path);
@@ -143,38 +164,13 @@ export default function Home() {
   };
 
   const handlePromptComplete = (decisions: LineDecision[]) => {
-    setEditableSegments(buildEditableSegments(transcript, decisions));
+    setEditableWords(buildEditableWords(transcript, decisions));
     setStep("edit");
   };
 
   const handleExport = () => {
-    const finalSegments = editableSegments
-      .filter((seg) => seg.action !== "remove")
-      .map((seg) => {
-        const keptWords = seg.words.filter((w) => !w.removed);
-        const text = keptWords.map((w) => w.text).join(" ");
-        if (!text.trim()) return null;
-
-        const anyWordRemoved = seg.words.some((w) => w.removed);
-
-        let start: number;
-        let end: number;
-
-        if (seg.action === "trim" || anyWordRemoved) {
-          const firstWord = keptWords.find((w) => w.start != null);
-          const lastWord = [...keptWords].reverse().find((w) => w.end != null);
-          start = firstWord?.start ?? seg.start;
-          end = lastWord?.end ?? seg.end;
-        } else {
-          start = seg.start;
-          end = seg.end;
-        }
-
-        return { start, end, text };
-      })
-      .filter(Boolean) as { start: number; end: number; text: string }[];
-
-    const xml = generateFCPXML(finalSegments, fileName, duration, fps);
+    const clips = computeFinalClips(editableWords);
+    const xml = generateFCPXML(clips, fileName, duration, fps);
     const blob = new Blob([xml], { type: "application/xml" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -208,9 +204,7 @@ export default function Home() {
       {/* Top bar */}
       <div className="border-b border-neutral-800 px-6 py-4">
         <div className="max-w-5xl mx-auto flex items-center gap-4">
-          <span className="text-lg font-bold tracking-tight">
-            ✂️ CLIPPER
-          </span>
+          <span className="text-lg font-bold tracking-tight">✂️ CLIPPER</span>
           <div className="flex items-center gap-1.5 ml-4">
             {stepLabels.map((s, i) => (
               <div key={s.key} className="flex items-center gap-1.5">
@@ -271,15 +265,15 @@ export default function Home() {
 
         {step === "edit" && (
           <VideoEditor
-            segments={editableSegments}
-            onChange={setEditableSegments}
+            words={editableWords}
+            onChange={setEditableWords}
             onContinue={() => setStep("export")}
           />
         )}
 
         {step === "export" && (
           <ExportStep
-            segments={editableSegments}
+            words={editableWords}
             fileName={fileName}
             duration={duration}
             onExport={handleExport}

@@ -26,41 +26,33 @@ export interface SegmentGroup {
   summary: string;
 }
 
-// LLM edit decisions — per transcript line
+// LLM edit decisions — per transcript utterance
 export type SegmentAction = "keep" | "remove" | "trim";
 
 export interface LineDecision {
   index: number;
   action: SegmentAction;
-  text?: string; // only present when action === "trim"
+  text?: string; // trimmed text when action === "trim"
 }
 
-// Per-word in the editable transcript
+// A single word in the editable transcript.
+// Every word carries its own Deepgram start/end timestamp.
+// Removing a word excludes exactly that time range from the FCPXML.
 export interface EditableWord {
   id: string;
   text: string;
   removed: boolean;
-  start?: number;
-  end?: number;
+  start: number;           // word-level timestamp from Deepgram (required)
+  end: number;             // word-level timestamp from Deepgram (required)
+  utteranceIdx: number;    // which source utterance this word belongs to (display grouping only)
   confidence?: number;
   speaker?: number | null;
-}
-
-// Editable segment — built from transcript + LLM decisions
-export interface EditableSegment {
-  originalIndex: number;
-  start: number;
-  end: number;
-  originalText: string;
-  editedText: string;
-  action: SegmentAction;
-  words: EditableWord[];
 }
 
 // App step flow
 export type AppStep = "browse" | "transcribe" | "segment" | "prompt" | "edit" | "export";
 
-// Full in-memory app state (replaces .vseg files)
+// Full in-memory app state
 export interface ClipperState {
   filePath: string;
   fileName: string;

@@ -50,7 +50,7 @@ function getFrameTimeFormat(fps: number): {
  *
  * Key design decisions:
  * - Frame rate from actual video (ffprobe); frameDuration matches video for accurate cuts.
- * - Use ceil for start/end to avoid cutting off content (never round down into kept audio).
+ * - Use round for start (avoids clipping word beginnings), ceil for end (never cut off content).
  * - Offset accumulated in integer frame units to prevent floating-point drift.
  * - Duration from ffprobe when available; timecodes start at 0.
  */
@@ -67,8 +67,8 @@ export function generateFCPXML(
 
   const clipElements = segments
     .map((seg) => {
-      // Ceil to never cut off content; Deepgram gives decimal seconds, we need frame indices
-      const startFrame = Math.ceil(seg.start * fps);
+      // Round start to avoid clipping word beginnings; ceil end to never cut off content
+      const startFrame = Math.round(seg.start * fps);
       const endFrame = Math.ceil(seg.end * fps);
       const durFrames = Math.max(1, endFrame - startFrame);
 

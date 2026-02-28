@@ -75,7 +75,7 @@ def extract_audio(video_path: str, audio_path: str):
             "-ac",
             "1",
             "-b:a",
-            "64k",
+            "128k",
             audio_path,
             "-y",
         ],
@@ -106,7 +106,7 @@ def split_audio_if_needed(audio_path: str) -> (List[str], Optional[str]):
             "-c:a",
             "libmp3lame",
             "-b:a",
-            "64k",
+            "128k",
             "-ar",
             "16000",
             "-ac",
@@ -237,14 +237,22 @@ def transcribe(audio_path: str, video_path: str):
             with open(chunk_path, "rb") as chunk_file:
                 audio_bytes = chunk_file.read()
 
-            response = client.listen.v1.media.transcribe_file(
-                request=audio_bytes,
+            transcribe_kwargs = dict(
                 model="nova-3",
                 smart_format=True,
                 punctuate=True,
                 utterances=True,
                 diarize=True,
                 paragraphs=True,
+            )
+            # Pass detected language to subsequent chunks so Deepgram doesn't
+            # waste cycles on language detection and diarization is more consistent.
+            if detected_language:
+                transcribe_kwargs["language"] = detected_language
+
+            response = client.listen.v1.media.transcribe_file(
+                request=audio_bytes,
+                **transcribe_kwargs,
             )
 
             chunk_data = response.model_dump()

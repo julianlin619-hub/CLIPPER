@@ -49,6 +49,9 @@ export interface EditableWord {
   speaker?: number | null;
 }
 
+// Speaker name map: Deepgram speaker ID → human-readable label (e.g. "Host", "Guest")
+export type SpeakerMap = Record<number, string>;
+
 // App step flow
 export type AppStep = "browse" | "transcribe" | "segment" | "prompt" | "edit" | "export";
 

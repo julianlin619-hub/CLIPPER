@@ -1,7 +1,14 @@
 "use client";
 
-import { EditableWord } from "@/lib/types";
-import { computeFinalClips, generateDebugTXT } from "@/lib/export";
+import { EditableWord, TranscriptEntry } from "@/lib/types";
+import {
+  computeFinalClips,
+  generateDebugTXT,
+  generateRawTranscript,
+  generateEditedTranscript,
+  generateExampleTranscript,
+  generateExampleDecisions,
+} from "@/lib/export";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -11,6 +18,7 @@ interface Props {
   fileName: string;
   duration: number;
   onExport: () => void;
+  transcript?: TranscriptEntry[];
 }
 
 function formatTime(seconds: number): string {
@@ -19,22 +27,45 @@ function formatTime(seconds: number): string {
   return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
-export default function ExportStep({ words, fileName, duration, onExport }: Props) {
+export default function ExportStep({ words, fileName, duration, onExport, transcript }: Props) {
   const clips = computeFinalClips(words);
 
   const totalDuration = clips.reduce((acc, c) => acc + (c.end - c.start), 0);
   const cutPercentage =
     duration > 0 ? Math.round(((duration - totalDuration) / duration) * 100) : 0;
 
-  const handleDownloadTXT = () => {
-    const txt = generateDebugTXT(words, fileName, duration);
-    const blob = new Blob([txt], { type: "text/plain" });
+  const downloadFile = (content: string, name: string, mime = "text/plain") => {
+    const blob = new Blob([content], { type: mime });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `${fileName.replace(/\.\w+$/, "")}_debug.txt`;
+    a.download = name;
     a.click();
     URL.revokeObjectURL(url);
+  };
+
+  const baseName = fileName.replace(/\.\w+$/, "");
+
+  const handleDownloadRawTranscript = () => {
+    downloadFile(generateRawTranscript(words), `${baseName}_raw_transcript.txt`);
+  };
+
+  const handleDownloadEditedTranscript = () => {
+    downloadFile(generateEditedTranscript(words), `${baseName}_edited_transcript.txt`);
+  };
+
+  const handleDownloadTXT = () => {
+    downloadFile(generateDebugTXT(words, fileName, duration), `${baseName}_debug.txt`);
+  };
+
+  const handleDownloadExampleTranscript = () => {
+    if (!transcript) return;
+    downloadFile(generateExampleTranscript(transcript, words), `${baseName}_example_transcript.txt`);
+  };
+
+  const handleDownloadExampleDecisions = () => {
+    if (!transcript) return;
+    downloadFile(generateExampleDecisions(words, transcript), `${baseName}_example_decisions.txt`);
   };
 
   return (
@@ -84,13 +115,34 @@ export default function ExportStep({ words, fileName, duration, onExport }: Prop
         <Button onClick={onExport} className="px-8" size="lg">
           Download XML
         </Button>
+        <Button onClick={handleDownloadRawTranscript} variant="outline" className="px-8" size="lg">
+          Raw Transcript
+        </Button>
+        <Button onClick={handleDownloadEditedTranscript} variant="outline" className="px-8" size="lg">
+          Edited Transcript
+        </Button>
         <Button onClick={handleDownloadTXT} variant="outline" className="px-8" size="lg">
-          Download Debug TXT
+          Debug TXT
         </Button>
         <p className="text-xs text-neutral-500 self-center">
           FCPXML 1.8 · Compatible with DaVinci Resolve, Final Cut Pro, Premiere Pro
         </p>
       </div>
+
+      {/* TEMPORARY: Prompt Example Export */}
+      {transcript && (
+        <div className="mt-4 pt-4 border-t border-neutral-800 flex gap-4 flex-wrap items-center">
+          <Button onClick={handleDownloadExampleTranscript} variant="outline" className="px-8 border-yellow-700 text-yellow-400 hover:bg-yellow-950" size="lg">
+            Example Transcript
+          </Button>
+          <Button onClick={handleDownloadExampleDecisions} variant="outline" className="px-8 border-yellow-700 text-yellow-400 hover:bg-yellow-950" size="lg">
+            Example Decisions
+          </Button>
+          <p className="text-xs text-yellow-700 self-center">
+            ⚗️ Temporary · for training example generation
+          </p>
+        </div>
+      )}
     </div>
   );
 }

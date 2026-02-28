@@ -8,9 +8,11 @@ import {
   LineDecision,
   EditableWord,
   WordTiming,
+  SpeakerMap,
 } from "@/lib/types";
 import { generateFCPXML } from "@/lib/xml";
 import { computeFinalClips } from "@/lib/export";
+import { autoDetectSpeakers } from "@/lib/speaker-utils";
 import FileBrowser from "@/components/file-browser";
 import TranscribeStep from "@/components/transcribe-step";
 import SegmentStep from "@/components/segment-step";
@@ -28,8 +30,8 @@ function normalizeWord(s: string): string {
  *
  * - "remove" utterances: all words marked removed=true
  * - "keep" utterances: all words marked removed=false
- * - "trim" utterances: attempt contiguous match of trimmed text against source
- *   words; if found, mark outside words as removed; on failure keep all.
+ * - "trim" utterances: greedy forward scan to match trimmed text against source
+ *   words (non-contiguous OK); unmatched words marked removed; on failure keep all.
  *
  * If an utterance has no word-level data, timestamps are interpolated
  * evenly across the utterance duration as a fallback.
@@ -70,29 +72,25 @@ function buildEditableWords(
       const trimTokens = decision.text.split(/\s+/).filter(Boolean).map(normalizeWord);
       const normSource = sourceWords.map((w) => normalizeWord(w.word));
 
-      // Try to find trimmed tokens as a contiguous subsequence
-      let startIdx = -1;
-      for (let si = 0; si <= normSource.length - trimTokens.length; si++) {
-        if (normSource[si] === trimTokens[0]) {
-          let match = true;
-          for (let ti = 1; ti < trimTokens.length; ti++) {
-            if (normSource[si + ti] !== trimTokens[ti]) {
-              match = false;
-              break;
-            }
-          }
-          if (match) {
-            startIdx = si;
+      // Greedy forward scan: match each trim token to the earliest unused
+      // source word. This handles non-contiguous trims (filler removed from
+      // the middle of an utterance) which the old contiguous matcher missed.
+      const kept = new Set<number>();
+      let si = 0;
+      for (const trimWord of trimTokens) {
+        while (si < normSource.length) {
+          if (normSource[si] === trimWord) {
+            kept.add(si);
+            si++;
             break;
           }
+          si++;
         }
       }
 
-      if (startIdx !== -1) {
-        const kept = new Set<number>();
-        for (let ti = 0; ti < trimTokens.length; ti++) {
-          kept.add(startIdx + ti);
-        }
+      // Accept if we matched at least 60% of the trim tokens.
+      // Below that, the LLM likely rewrote too much — fall back to keep all.
+      if (kept.size >= trimTokens.length * 0.6) {
         const removed = new Set<number>();
         sourceWords.forEach((_, i) => {
           if (!kept.has(i)) removed.add(i);
@@ -133,8 +131,10 @@ export default function Home() {
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
   const [duration, setDuration] = useState(0);
   const [fps, setFps] = useState(30);
+  const [speakerMap, setSpeakerMap] = useState<SpeakerMap>({});
   const [segments, setSegments] = useState<SegmentGroup[]>([]);
   const [editableWords, setEditableWords] = useState<EditableWord[]>([]);
+  const [decisions, setDecisions] = useState<LineDecision[]>([]);
 
   const handleFileSelected = (path: string, name: string) => {
     setFilePath(path);
@@ -150,6 +150,7 @@ export default function Home() {
     setTranscript(t);
     setDuration(d);
     setFps(frameRate);
+    setSpeakerMap(autoDetectSpeakers(t));
     setStep("segment");
   };
 
@@ -164,6 +165,7 @@ export default function Home() {
   };
 
   const handlePromptComplete = (decisions: LineDecision[]) => {
+    setDecisions(decisions);
     setEditableWords(buildEditableWords(transcript, decisions));
     setStep("edit");
   };
@@ -259,6 +261,7 @@ export default function Home() {
           <PromptStep
             transcript={transcript}
             segments={segments}
+            speakerMap={speakerMap}
             onComplete={handlePromptComplete}
           />
         )}
@@ -277,6 +280,7 @@ export default function Home() {
             fileName={fileName}
             duration={duration}
             onExport={handleExport}
+            transcript={transcript}
           />
         )}
       </div>

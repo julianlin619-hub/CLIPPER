@@ -1,4 +1,4 @@
-import { EditableWord } from "@/lib/types";
+import { EditableWord, TranscriptEntry } from "@/lib/types";
 
 function fmt(seconds: number): string {
   const m = Math.floor(seconds / 60);
@@ -39,6 +39,34 @@ export function computeFinalClips(
   }
 
   return clips;
+}
+
+/**
+ * Generate a plain-text transcript from all words (raw/original).
+ */
+export function generateRawTranscript(words: EditableWord[]): string {
+  const lines: string[] = [];
+  let lastSpeaker: number | null | undefined = undefined;
+
+  for (const word of words) {
+    if (word.speaker !== lastSpeaker) {
+      if (lines.length > 0) lines.push("");
+      lines.push(`Speaker ${word.speaker ?? "?"}:`);
+      lastSpeaker = word.speaker;
+    }
+    // append word to the last line
+    const last = lines.length - 1;
+    lines[last] = lines[last] + " " + word.text;
+  }
+
+  return lines.map((l) => l.trim()).join("\n");
+}
+
+/**
+ * Generate a plain-text transcript from only the kept (non-removed) words.
+ */
+export function generateEditedTranscript(words: EditableWord[]): string {
+  return generateRawTranscript(words.filter((w) => !w.removed));
 }
 
 /**
@@ -110,4 +138,129 @@ export function generateDebugTXT(
   lines.push(`END — ${clipNum} clips · ${fmt(exportedDuration)} kept of ${fmt(totalDuration)} total`);
 
   return lines.join("\n");
+}
+
+// ─── Speaker-turn helpers ────────────────────────────────────────────────────
+
+interface SpeakerTurn {
+  turnIdx: number;
+  speaker: string;
+  originalText: string; // full merged text of all utterances in this turn
+  keptText: string;     // joined kept word tokens
+  action: "keep" | "remove" | "trim";
+}
+
+/**
+ * Merge consecutive same-speaker Deepgram utterances into speaker turns,
+ * then compute a KEEP/REMOVE/TRIM action for each turn based on the
+ * actual word-level state (post-editor).
+ *
+ * This mirrors the structure of the DEFAULT_EDIT_PROMPT examples, where
+ * each [index] is a complete speaker turn rather than a Deepgram micro-utterance.
+ */
+function buildSpeakerTurns(
+  transcript: TranscriptEntry[],
+  words: EditableWord[]
+): SpeakerTurn[] {
+  // Map utteranceIdx → { kept[], total }
+  const uttKept = new Map<number, string[]>();
+  const uttTotal = new Map<number, number>();
+  for (const word of words) {
+    if (!uttTotal.has(word.utteranceIdx)) {
+      uttTotal.set(word.utteranceIdx, 0);
+      uttKept.set(word.utteranceIdx, []);
+    }
+    uttTotal.set(word.utteranceIdx, (uttTotal.get(word.utteranceIdx) ?? 0) + 1);
+    if (!word.removed) uttKept.get(word.utteranceIdx)!.push(word.text);
+  }
+
+  // Speaker label per utterance
+  const uttSpeaker = transcript.map((entry) => {
+    const spk = entry.words?.[0]?.speaker ?? null;
+    return spk != null ? `Speaker ${spk}` : "Speaker";
+  });
+
+  // Merge consecutive same-speaker utterances
+  type Acc = {
+    speaker: string;
+    originalTexts: string[];
+    keptWords: string[];
+    totalWords: number;
+    keptWords_count: number;
+  };
+
+  const merged: Acc[] = [];
+  for (let i = 0; i < transcript.length; i++) {
+    const spk = uttSpeaker[i];
+    const keptWds = uttKept.get(i) ?? [];
+    const total = uttTotal.get(i) ?? 0;
+    const last = merged[merged.length - 1];
+    if (last && last.speaker === spk) {
+      last.originalTexts.push(transcript[i].text);
+      last.keptWords.push(...keptWds);
+      last.totalWords += total;
+      last.keptWords_count += keptWds.length;
+    } else {
+      merged.push({
+        speaker: spk,
+        originalTexts: [transcript[i].text],
+        keptWords: [...keptWds],
+        totalWords: total,
+        keptWords_count: keptWds.length,
+      });
+    }
+  }
+
+  return merged.map((turn, idx) => {
+    const action: "keep" | "remove" | "trim" =
+      turn.keptWords_count === 0
+        ? "remove"
+        : turn.keptWords_count === turn.totalWords
+        ? "keep"
+        : "trim";
+    return {
+      turnIdx: idx,
+      speaker: turn.speaker,
+      originalText: turn.originalTexts.join(" "),
+      keptText: turn.keptWords.join(" "),
+      action,
+    };
+  });
+}
+
+// ─── Public generators ────────────────────────────────────────────────────────
+
+/**
+ * Generate a numbered raw transcript in the prompt-example format:
+ *   [0] Speaker 0: Hello there.
+ *   [1] Speaker 1: Right.
+ * Consecutive same-speaker Deepgram utterances are merged into one turn.
+ */
+export function generateExampleTranscript(
+  transcript: TranscriptEntry[],
+  words: EditableWord[]
+): string {
+  return buildSpeakerTurns(transcript, words)
+    .map((t) => `[${t.turnIdx}] ${t.speaker}: ${t.originalText}`)
+    .join("\n");
+}
+
+/**
+ * Generate the decisions block in the prompt-example format, derived from
+ * speaker turns (so they match the Final Transcript Preview):
+ *   [0] KEEP
+ *   [1] REMOVE
+ *   [2] TRIM: trimmed text here
+ */
+export function generateExampleDecisions(
+  words: EditableWord[],
+  transcript: TranscriptEntry[]
+): string {
+  return buildSpeakerTurns(transcript, words)
+    .map((t) => {
+      if (t.action === "keep") return `[${t.turnIdx}] KEEP`;
+      if (t.action === "remove") return `[${t.turnIdx}] REMOVE`;
+      return `[${t.turnIdx}] TRIM: ${t.keptText}`;
+    })
+    .join("\n");
 }

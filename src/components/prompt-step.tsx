@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useCallback } from "react";
-import { TranscriptEntry, SegmentGroup, LineDecision } from "@/lib/types";
+import { TranscriptEntry, SegmentGroup, LineDecision, SpeakerMap } from "@/lib/types";
 import { processSegmentGroup } from "@/app/actions/process-single";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
@@ -11,6 +11,7 @@ import { DEFAULT_EDIT_PROMPT } from "@/prompts/default-edit";
 interface Props {
   transcript: TranscriptEntry[];
   segments: SegmentGroup[];
+  speakerMap?: SpeakerMap;
   onComplete: (decisions: LineDecision[]) => void;
 }
 
@@ -30,7 +31,7 @@ interface SegGroupStatus {
   trimmed?: number;
 }
 
-export default function PromptStep({ transcript, segments, onComplete }: Props) {
+export default function PromptStep({ transcript, segments, speakerMap, onComplete }: Props) {
   const [mode, setMode] = useState<PromptMode>("default");
   const [customPrompt, setCustomPrompt] = useState("");
   const [model, setModel] = useState(MODELS[0].value);
@@ -70,7 +71,8 @@ export default function PromptStep({ transcript, segments, onComplete }: Props) 
             activePrompt,
             model,
             group.title,
-            group.summary
+            group.summary,
+            speakerMap
           );
           const kept = decisions.filter((d) => d.action === "keep").length;
           const removed = decisions.filter((d) => d.action === "remove").length;
@@ -103,7 +105,10 @@ export default function PromptStep({ transcript, segments, onComplete }: Props) 
           transcript,
           0,
           activePrompt,
-          model
+          model,
+          undefined,
+          undefined,
+          speakerMap
         );
         statuses[0] = {
           ...statuses[0],

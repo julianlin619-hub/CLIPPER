@@ -1,73 +1,88 @@
-import { LineDecision } from "@/lib/types";
-
-const SYSTEM_PROMPT = `You are a video transcript editor. You will receive a segment of a transcript (multiple lines, each with an index) and a user editing instruction.
-
-For EACH line, decide one of three actions:
-- "keep" — leave the line unchanged
-- "remove" — delete the line entirely  
-- "trim" — edit/shorten the text (you MUST provide the new text)
-
-CRITICAL RULES:
-1. You must return a decision for EVERY line
-2. You must NOT include any timecode/timestamp information — only index, action, and optionally text
-3. For "trim", the new text must be a subset or rephrasing of the original — do not add new content
-4. Return ONLY a valid JSON array, no markdown, no explanation
-
-Response format:
-[
-  { "index": 0, "action": "keep" },
-  { "index": 1, "action": "remove" },
-  { "index": 2, "action": "trim", "text": "shortened text" }
-]`;
+import { LineDecision, SpeakerMap } from "@/lib/types";
 
 /**
- * Build the user message for a segment group (all its transcript lines)
+ * Build the user message for the LLM edit step.
+ * Each line is prefixed with [index] and its speaker label so the LLM
+ * can reference utterances by index in its decision output.
+ *
+ * If a speakerMap is provided (e.g. {0: "Host", 1: "Guest"}), resolved names
+ * are used instead of the raw "Speaker N" fallback.
  */
-export function buildSegmentMessage(
-  lines: { index: number; text: string }[],
-  editPrompt: string,
+export function buildCreativeMessage(
+  lines: { index: number; text: string; speaker?: number | null }[],
   segmentTitle?: string,
-  segmentSummary?: string
+  segmentSummary?: string,
+  speakerMap?: SpeakerMap
 ): string {
   const context = segmentTitle
     ? `## Segment: ${segmentTitle}${segmentSummary ? `\n${segmentSummary}` : ""}\n\n`
     : "";
 
   const lineList = lines
-    .map((l) => `[${l.index}] ${l.text}`)
+    .map((l) => {
+      const label =
+        l.speaker != null
+          ? (speakerMap?.[l.speaker] ?? `Speaker ${l.speaker}`)
+          : "Speaker";
+      return `[${l.index}] ${label}: ${l.text}`;
+    })
     .join("\n");
 
-  return `## Editing Instruction
-${editPrompt}
-
-${context}## Transcript Lines
-${lineList}`;
+  return `${context}## Transcript\n${lineList}`;
 }
 
 /**
- * Parse LLM response into line decisions
+ * Parse the LLM's index-based decision output into LineDecision[].
+ *
+ * Expected format (one per line):
+ *   [0] REMOVE
+ *   [1] KEEP
+ *   [2] TRIM: Some trimmed text here
+ *
+ * Lines not listed are assumed REMOVE.
+ * Robust: ignores blank lines, commentary, and markdown fences.
  */
-export function parseDecisions(response: string): LineDecision[] {
+export function parseIndexedDecisions(
+  response: string,
+  totalLines: number,
+  startIndex: number
+): LineDecision[] {
+  const decisionMap = new Map<number, LineDecision>();
+
+  // Strip markdown code fences if present
   let cleaned = response.trim();
   if (cleaned.startsWith("```")) {
-    cleaned = cleaned.replace(/^```(?:json)?\n?/, "").replace(/\n?```$/, "");
+    cleaned = cleaned.replace(/^```[^\n]*\n?/, "").replace(/\n?```$/, "");
   }
 
-  const decisions: LineDecision[] = JSON.parse(cleaned);
+  // Parse each line
+  const linePattern = /^\[(\d+)\]\s+(KEEP|REMOVE|TRIM)(?:\s*:\s*(.*))?$/i;
 
-  for (const d of decisions) {
-    if (typeof d.index !== "number") throw new Error("Invalid decision: missing index");
-    if (!["keep", "remove", "trim"].includes(d.action)) {
-      throw new Error(`Invalid action "${d.action}" for line ${d.index}`);
+  for (const line of cleaned.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+
+    const match = trimmed.match(linePattern);
+    if (!match) continue;
+
+    const index = parseInt(match[1], 10);
+    const action = match[2].toLowerCase() as "keep" | "remove" | "trim";
+    const text = match[3]?.trim() || undefined;
+
+    if (action === "trim" && !text) {
+      // TRIM without text → treat as KEEP (safe fallback)
+      decisionMap.set(index, { index, action: "keep" });
+    } else {
+      decisionMap.set(index, { index, action, ...(text ? { text } : {}) });
     }
-    if (d.action === "trim" && !d.text) {
-      throw new Error(`Line ${d.index} is "trim" but missing text`);
-    }
+  }
+
+  // Fill in missing indices as REMOVE
+  const decisions: LineDecision[] = [];
+  for (let i = 0; i < totalLines; i++) {
+    const idx = startIndex + i;
+    decisions.push(decisionMap.get(idx) ?? { index: idx, action: "remove" });
   }
 
   return decisions;
-}
-
-export function getSystemPrompt(): string {
-  return SYSTEM_PROMPT;
 }

@@ -1,36 +1,83 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# ✂️ CLIPPER
 
-## Getting Started
+AI-powered video transcript editor. Transcribe a video, segment it by topic, use an LLM to cut filler and fluff, then export a clean FCPXML timeline for Final Cut Pro.
 
-First, run the development server:
+## What it does
+
+1. **Select** a video file from your local filesystem
+2. **Transcribe** with Deepgram (word-level timestamps)
+3. **Segment** the transcript into topic sections with Claude
+4. **LLM Edit** — Claude reviews each segment and marks lines to keep, trim, or remove
+5. **Edit** — word-level editor to fine-tune cuts per segment
+6. **Export** — downloads an FCPXML file ready for Final Cut Pro
+
+## Requirements
+
+- Node.js 18+
+- Python 3.9+
+- ffmpeg (for audio extraction)
+
+## Setup
+
+### 1. Clone and install
+
+```bash
+git clone <repo-url>
+cd CLIPPER
+npm install
+```
+
+### 2. Python dependencies
+
+```bash
+pip3 install -r requirements.txt
+```
+
+### 3. Install ffmpeg
+
+```bash
+# macOS
+brew install ffmpeg
+
+# Ubuntu/Debian
+sudo apt install ffmpeg
+```
+
+### 4. Configure environment
+
+```bash
+cp .env.example .env.local
+```
+
+Edit `.env.local` and fill in your API keys:
+
+| Key | Where to get it |
+|-----|----------------|
+| `DEEPGRAM_API_KEY` | [console.deepgram.com](https://console.deepgram.com) |
+| `ANTHROPIC_API_KEY` | [console.anthropic.com](https://console.anthropic.com) |
+| `OPENAI_API_KEY` | [platform.openai.com](https://platform.openai.com) (optional) |
+
+### 5. Run
 
 ```bash
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Open [http://localhost:3000](http://localhost:3000).
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Basic Auth (optional)
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+By default the app is open with no login. If you want to protect it (e.g. when sharing via Tailscale), set these in `.env.local`:
 
-## Learn More
+```
+ACCESS_USERNAME=admin
+ACCESS_PASSWORD=yourpassword
+```
 
-To learn more about Next.js, take a look at the following resources:
+To disable auth entirely, delete `src/proxy.ts`.
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## Notes
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+- Video files are read directly from your local filesystem — nothing is uploaded to external storage
+- API calls go to Deepgram (transcription) and Anthropic (segmentation + editing)
+- FCPXML export works with Final Cut Pro 10.6+

@@ -16,7 +16,6 @@ interface Props {
 }
 
 const MODELS = [
-  { value: "claude-opus-4-20250514", label: "Claude Opus 4.6" },
   { value: "claude-sonnet-4-20250514", label: "Claude Sonnet 4.6" },
 ];
 

@@ -8,6 +8,7 @@ import {
   generateEditedTranscript,
   generateExampleTranscript,
   generateExampleDecisions,
+  generateSRT,
 } from "@/lib/export";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -68,6 +69,10 @@ export default function ExportStep({ words, fileName, duration, onExport, transc
     downloadFile(generateExampleDecisions(words, transcript), `${baseName}_example_decisions.txt`);
   };
 
+  const handleDownloadSRT = () => {
+    downloadFile(generateSRT(words), `${baseName}_captions.srt`, "text/plain");
+  };
+
   return (
     <div>
       <h2 className="text-2xl font-bold mb-2">Export</h2>
@@ -120,6 +125,9 @@ export default function ExportStep({ words, fileName, duration, onExport, transc
         </Button>
         <Button onClick={handleDownloadEditedTranscript} variant="outline" className="px-8" size="lg">
           Edited Transcript
+        </Button>
+        <Button onClick={handleDownloadSRT} variant="outline" className="px-8" size="lg">
+          Captions (SRT)
         </Button>
         <Button onClick={handleDownloadTXT} variant="outline" className="px-8" size="lg">
           Debug TXT

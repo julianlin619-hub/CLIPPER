@@ -269,6 +269,7 @@ export default function Home() {
         {step === "edit" && (
           <VideoEditor
             words={editableWords}
+            segments={segments}
             onChange={setEditableWords}
             onContinue={() => setStep("export")}
           />

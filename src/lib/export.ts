@@ -228,6 +228,77 @@ function buildSpeakerTurns(
   });
 }
 
+
+// ─── SRT caption export ───────────────────────────────────────────────────────
+
+/**
+ * Format seconds as SRT timestamp: HH:MM:SS,mmm
+ */
+function fmtSRT(seconds: number): string {
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = Math.floor(seconds % 60);
+  const ms = Math.round((seconds % 1) * 1000);
+  return `${h.toString().padStart(2, "0")}:${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")},${ms.toString().padStart(3, "0")}`;
+}
+
+/**
+ * Generate an SRT subtitle file from the kept words.
+ *
+ * Each contiguous run of kept words becomes one or more subtitle entries.
+ * Long clips (> MAX_CAPTION_WORDS words) are split so captions stay
+ * readable on screen. Timecodes are word-level for accurate in/out points.
+ */
+export function generateSRT(words: EditableWord[]): string {
+  const MAX_CAPTION_WORDS = 3;
+
+  // Compute timeline-relative timecodes by subtracting only the time removed
+  // by cuts — natural gaps between words within a clip are preserved so
+  // captions stay in sync with the sewn-together video.
+  let offset = 0;
+  let lastKeptEnd: number | null = null;
+  let inCut = false;
+
+  const timedKept: { text: string; start: number; end: number }[] = [];
+
+  for (const word of words) {
+    if (word.removed) {
+      if (!inCut && lastKeptEnd !== null) {
+        // entering a cut — record where the gap starts
+        inCut = true;
+      }
+    } else {
+      if (inCut && lastKeptEnd !== null) {
+        // leaving a cut — the gap from lastKeptEnd to word.start is removed footage
+        offset += word.start - lastKeptEnd;
+        inCut = false;
+      }
+      timedKept.push({
+        text: word.text,
+        start: word.start - offset,
+        end: word.end - offset,
+      });
+      lastKeptEnd = word.end;
+    }
+  }
+
+  // Chunk into captions of MAX_CAPTION_WORDS
+  const captionChunks: { start: number; end: number; text: string }[] = [];
+  for (let i = 0; i < timedKept.length; i += MAX_CAPTION_WORDS) {
+    const slice = timedKept.slice(i, i + MAX_CAPTION_WORDS);
+    captionChunks.push({
+      start: slice[0].start,
+      end: slice[slice.length - 1].end,
+      text: slice.map((w) => w.text).join(" "),
+    });
+  }
+
+  // {\an5} = SubStation Alpha center-screen alignment, supported by DaVinci Resolve
+  return captionChunks
+    .map((c, i) => `${i + 1}\n${fmtSRT(c.start)} --> ${fmtSRT(c.end)}\n${c.text}`)
+    .join("\n\n");
+}
+
 // ─── Public generators ────────────────────────────────────────────────────────
 
 /**

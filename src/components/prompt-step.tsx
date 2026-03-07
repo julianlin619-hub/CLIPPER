@@ -153,7 +153,7 @@ export default function PromptStep({ transcript, segments, speakerMap, onComplet
             onClick={() => setMode("default")}
             className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
               mode === "default"
-                ? "bg-white text-black"
+                ? "bg-violet-600 text-white"
                 : "bg-neutral-800 text-neutral-400 hover:text-white"
             }`}
             disabled={loading}
@@ -164,7 +164,7 @@ export default function PromptStep({ transcript, segments, speakerMap, onComplet
             onClick={() => setMode("custom")}
             className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
               mode === "custom"
-                ? "bg-white text-black"
+                ? "bg-violet-600 text-white"
                 : "bg-neutral-800 text-neutral-400 hover:text-white"
             }`}
             disabled={loading}

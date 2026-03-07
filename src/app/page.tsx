@@ -14,8 +14,6 @@ import { generateFCPXML } from "@/lib/xml";
 import { computeFinalClips } from "@/lib/export";
 import { autoDetectSpeakers } from "@/lib/speaker-utils";
 import FileBrowser from "@/components/file-browser";
-import TranscribeStep from "@/components/transcribe-step";
-import SegmentStep from "@/components/segment-step";
 import PromptStep from "@/components/prompt-step";
 import VideoEditor from "@/components/video-editor";
 import ExportStep from "@/components/export-step";
@@ -135,32 +133,21 @@ export default function Home() {
   const [segments, setSegments] = useState<SegmentGroup[]>([]);
   const [editableWords, setEditableWords] = useState<EditableWord[]>([]);
   const [decisions, setDecisions] = useState<LineDecision[]>([]);
-
-  const handleFileSelected = (path: string, name: string) => {
-    setFilePath(path);
-    setFileName(name);
-    setStep("transcribe");
-  };
+  const [fcpxmlPath, setFcpxmlPath] = useState<string>("");
 
   const handleTranscribeComplete = (
     t: TranscriptEntry[],
     d: number,
-    frameRate: number = 30
+    frameRate: number = 30,
+    videoPath: string = "",
+    segs: SegmentGroup[] = []
   ) => {
+    if (videoPath) setFilePath(videoPath);
     setTranscript(t);
     setDuration(d);
     setFps(frameRate);
     setSpeakerMap(autoDetectSpeakers(t));
-    setStep("segment");
-  };
-
-  const handleSegmentComplete = (segs: SegmentGroup[]) => {
     setSegments(segs);
-    setStep("prompt");
-  };
-
-  const handleSegmentSkip = () => {
-    setSegments([]);
     setStep("prompt");
   };
 
@@ -183,18 +170,14 @@ export default function Home() {
   };
 
   const stepLabels: { key: AppStep; label: string }[] = [
-    { key: "browse", label: "1. Select Video" },
-    { key: "transcribe", label: "2. Transcribe" },
-    { key: "segment", label: "3. Segment" },
-    { key: "prompt", label: "4. LLM Edit" },
-    { key: "edit", label: "5. Edit" },
-    { key: "export", label: "6. Export" },
+    { key: "browse", label: "1. Transcribe" },
+    { key: "prompt", label: "2. Clip" },
+    { key: "edit", label: "3. Edit" },
+    { key: "export", label: "4. Export" },
   ];
 
   const stepOrder: AppStep[] = [
     "browse",
-    "transcribe",
-    "segment",
     "prompt",
     "edit",
     "export",
@@ -218,7 +201,7 @@ export default function Home() {
                   disabled={stepOrder.indexOf(s.key) > currentIdx}
                   className={`text-xs px-3 py-1.5 rounded-full transition-colors ${
                     step === s.key
-                      ? "bg-white text-black font-medium"
+                      ? "bg-violet-600 text-white font-medium"
                       : stepOrder.indexOf(s.key) < currentIdx
                       ? "text-neutral-400 hover:text-neutral-200 cursor-pointer"
                       : "text-neutral-700 cursor-not-allowed"
@@ -238,23 +221,7 @@ export default function Home() {
       {/* Content */}
       <div className="max-w-5xl mx-auto px-6 py-8">
         {step === "browse" && (
-          <FileBrowser onFileSelected={handleFileSelected} />
-        )}
-
-        {step === "transcribe" && (
-          <TranscribeStep
-            filePath={filePath}
-            fileName={fileName}
-            onComplete={handleTranscribeComplete}
-          />
-        )}
-
-        {step === "segment" && (
-          <SegmentStep
-            transcript={transcript}
-            onComplete={handleSegmentComplete}
-            onSkip={handleSegmentSkip}
-          />
+          <FileBrowser onComplete={handleTranscribeComplete} fcpxmlPath={fcpxmlPath} onFcpxmlSelected={setFcpxmlPath} />
         )}
 
         {step === "prompt" && (
@@ -272,6 +239,7 @@ export default function Home() {
             segments={segments}
             onChange={setEditableWords}
             onContinue={() => setStep("export")}
+            videoSrc={filePath ? `/api/video?path=${encodeURIComponent(filePath)}` : undefined}
           />
         )}
 
@@ -282,6 +250,7 @@ export default function Home() {
             duration={duration}
             onExport={handleExport}
             transcript={transcript}
+            fcpxmlPath={fcpxmlPath}
           />
         )}
       </div>

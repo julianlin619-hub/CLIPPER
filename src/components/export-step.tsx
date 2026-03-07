@@ -1,18 +1,8 @@
 "use client";
 
+import { useState } from "react";
 import { EditableWord, TranscriptEntry } from "@/lib/types";
-import {
-  computeFinalClips,
-  generateDebugTXT,
-  generateRawTranscript,
-  generateEditedTranscript,
-  generateExampleTranscript,
-  generateExampleDecisions,
-  generateSRT,
-} from "@/lib/export";
-import { Button } from "@/components/ui/button";
-import { Card } from "@/components/ui/card";
-import { Badge } from "@/components/ui/badge";
+import { computeFinalClips, generateSRT } from "@/lib/export";
 
 interface Props {
   words: EditableWord[];
@@ -20,20 +10,14 @@ interface Props {
   duration: number;
   onExport: () => void;
   transcript?: TranscriptEntry[];
+  fcpxmlPath?: string;
 }
 
-function formatTime(seconds: number): string {
-  const m = Math.floor(seconds / 60);
-  const s = Math.floor(seconds % 60);
-  return `${m}:${s.toString().padStart(2, "0")}`;
-}
-
-export default function ExportStep({ words, fileName, duration, onExport, transcript }: Props) {
+export default function ExportStep({ words, fileName, duration, fcpxmlPath }: Props) {
   const clips = computeFinalClips(words);
-
-  const totalDuration = clips.reduce((acc, c) => acc + (c.end - c.start), 0);
-  const cutPercentage =
-    duration > 0 ? Math.round(((duration - totalDuration) / duration) * 100) : 0;
+  const [patchLoading, setPatchLoading] = useState(false);
+  const [patchError, setPatchError] = useState<string | null>(null);
+  const baseName = fileName.replace(/\.\w+$/, "");
 
   const downloadFile = (content: string, name: string, mime = "text/plain") => {
     const blob = new Blob([content], { type: mime });
@@ -45,112 +29,70 @@ export default function ExportStep({ words, fileName, duration, onExport, transc
     URL.revokeObjectURL(url);
   };
 
-  const baseName = fileName.replace(/\.\w+$/, "");
-
-  const handleDownloadRawTranscript = () => {
-    downloadFile(generateRawTranscript(words), `${baseName}_raw_transcript.txt`);
+  const handleMasterXml = async () => {
+    if (!fcpxmlPath) return;
+    setPatchLoading(true);
+    setPatchError(null);
+    try {
+      const { generateFCPXML } = await import("@/lib/xml");
+      const editedXml = generateFCPXML(clips, fileName, duration, 30);
+      const res = await fetch("/api/patch-fcpxml", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ fcpxmlPath, editedXml }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ error: res.statusText }));
+        throw new Error(err.error || "Patch failed");
+      }
+      const xml = await res.text();
+      downloadFile(xml, `${baseName}_master.fcpxml`, "application/xml");
+    } catch (e: unknown) {
+      setPatchError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setPatchLoading(false);
+    }
   };
 
-  const handleDownloadEditedTranscript = () => {
-    downloadFile(generateEditedTranscript(words), `${baseName}_edited_transcript.txt`);
-  };
-
-  const handleDownloadTXT = () => {
-    downloadFile(generateDebugTXT(words, fileName, duration), `${baseName}_debug.txt`);
-  };
-
-  const handleDownloadExampleTranscript = () => {
-    if (!transcript) return;
-    downloadFile(generateExampleTranscript(transcript, words), `${baseName}_example_transcript.txt`);
-  };
-
-  const handleDownloadExampleDecisions = () => {
-    if (!transcript) return;
-    downloadFile(generateExampleDecisions(words, transcript), `${baseName}_example_decisions.txt`);
-  };
-
-  const handleDownloadSRT = () => {
-    downloadFile(generateSRT(words), `${baseName}_captions.srt`, "text/plain");
+  const handleSRT = () => {
+    downloadFile(generateSRT(words), `${baseName}_captions.srt`);
   };
 
   return (
-    <div>
-      <h2 className="text-2xl font-bold mb-2">Export</h2>
-      <p className="text-neutral-400 mb-6 text-sm">
-        Review the final output and download as FCP XML.
-      </p>
-
-      {/* Summary */}
-      <div className="grid grid-cols-3 gap-4 mb-6">
-        <Card className="p-4 border-neutral-800 bg-neutral-900/50 text-center">
-          <div className="text-2xl font-bold">{clips.length}</div>
-          <div className="text-sm text-neutral-400">clips</div>
-        </Card>
-        <Card className="p-4 border-neutral-800 bg-neutral-900/50 text-center">
-          <div className="text-2xl font-bold">{formatTime(totalDuration)}</div>
-          <div className="text-sm text-neutral-400">total duration</div>
-        </Card>
-        <Card className="p-4 border-neutral-800 bg-neutral-900/50 text-center">
-          <div className="text-2xl font-bold text-red-400">{cutPercentage}%</div>
-          <div className="text-sm text-neutral-400">cut</div>
-        </Card>
+    <div className="max-w-2xl mx-auto">
+      <div className="mb-8">
+        <h2 className="text-2xl font-bold mb-1">Export</h2>
+        <p className="text-neutral-400 text-sm">Download your edited output.</p>
       </div>
 
-      {/* Preview */}
-      <Card className="p-4 border-neutral-800 bg-neutral-900/30 mb-6">
-        <h3 className="text-sm font-medium text-neutral-300 mb-3">
-          Final Transcript Preview
-        </h3>
-        <div className="space-y-2 max-h-[300px] overflow-y-auto">
-          {clips.map((clip, i) => (
-            <div key={i} className="flex gap-3 py-1">
-              <Badge
-                variant="outline"
-                className="bg-neutral-800 border-neutral-700 text-neutral-400 shrink-0"
-              >
-                {formatTime(clip.start)}
-              </Badge>
-              <span className="text-sm text-neutral-300">{clip.text}</span>
-            </div>
-          ))}
-        </div>
-      </Card>
+      <div className="space-y-3">
+        <button
+          onClick={handleMasterXml}
+          disabled={patchLoading || !fcpxmlPath}
+          className="w-full flex items-center justify-between px-5 py-4 rounded-xl border border-violet-500/50 bg-violet-950/30 hover:bg-violet-950/50 hover:border-violet-400 disabled:opacity-40 disabled:cursor-not-allowed transition-all group"
+        >
+          <div className="text-left">
+            <p className="text-sm font-semibold text-violet-200">Master XML</p>
+            <p className="text-xs text-violet-400/70 mt-0.5">Multicam FCPXML with cuts applied across all camera tracks</p>
+          </div>
+          <span className="text-violet-400 group-hover:text-violet-200 transition-colors text-lg">
+            {patchLoading ? "⏳" : "⬇"}
+          </span>
+        </button>
 
-      <div className="flex gap-4 flex-wrap items-center">
-        <Button onClick={onExport} className="px-8" size="lg">
-          Download XML
-        </Button>
-        <Button onClick={handleDownloadRawTranscript} variant="outline" className="px-8" size="lg">
-          Raw Transcript
-        </Button>
-        <Button onClick={handleDownloadEditedTranscript} variant="outline" className="px-8" size="lg">
-          Edited Transcript
-        </Button>
-        <Button onClick={handleDownloadSRT} variant="outline" className="px-8" size="lg">
-          Captions (SRT)
-        </Button>
-        <Button onClick={handleDownloadTXT} variant="outline" className="px-8" size="lg">
-          Debug TXT
-        </Button>
-        <p className="text-xs text-neutral-500 self-center">
-          FCPXML 1.8 · Compatible with DaVinci Resolve, Final Cut Pro, Premiere Pro
-        </p>
+        {patchError && <p className="text-sm text-red-400 px-1">{patchError}</p>}
+
+        <button
+          onClick={handleSRT}
+          className="w-full flex items-center justify-between px-5 py-4 rounded-xl border border-neutral-700 bg-neutral-900/50 hover:bg-violet-950/30 hover:border-violet-500/60 transition-all group"
+        >
+          <div className="text-left">
+            <p className="text-sm font-semibold text-white">Captions SRT</p>
+            <p className="text-xs text-neutral-500 mt-0.5">Subtitle file synced to the edited timeline</p>
+          </div>
+          <span className="text-neutral-500 group-hover:text-violet-300 transition-colors text-lg">⬇</span>
+        </button>
       </div>
-
-      {/* TEMPORARY: Prompt Example Export */}
-      {transcript && (
-        <div className="mt-4 pt-4 border-t border-neutral-800 flex gap-4 flex-wrap items-center">
-          <Button onClick={handleDownloadExampleTranscript} variant="outline" className="px-8 border-yellow-700 text-yellow-400 hover:bg-yellow-950" size="lg">
-            Example Transcript
-          </Button>
-          <Button onClick={handleDownloadExampleDecisions} variant="outline" className="px-8 border-yellow-700 text-yellow-400 hover:bg-yellow-950" size="lg">
-            Example Decisions
-          </Button>
-          <p className="text-xs text-yellow-700 self-center">
-            ⚗️ Temporary · for training example generation
-          </p>
-        </div>
-      )}
     </div>
   );
 }

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Extract audio from video and transcribe with Deepgram (nova-3)."""
+"""Transcribe audio files with Deepgram (nova-3)."""
 
+import asyncio
 import json
 import os
 import shutil
@@ -10,19 +11,13 @@ import tempfile
 from pathlib import Path
 from typing import List, Optional
 
-from deepgram import DeepgramClient
+from deepgram import AsyncDeepgramClient
 
 MAX_DEEPGRAM_FILE_SIZE = 25 * 1024 * 1024  # 25MB upload limit
 CHUNK_DURATION_SECONDS = 600  # 10 minutes per chunk
-
 FRAGMENT_TEMPLATE = "chunk-%03d.mp3"
-
-
-def get_deepgram_client() -> DeepgramClient:
-    api_key = os.environ.get("DEEPGRAM_API_KEY")
-    if not api_key:
-        raise RuntimeError("DEEPGRAM_API_KEY not set")
-    return DeepgramClient(api_key=api_key)  # v6: keyword-only
+AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".wma"}
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v"}
 
 
 def run_command(cmd: List[str]) -> str:
@@ -32,111 +27,56 @@ def run_command(cmd: List[str]) -> str:
     return result.stdout.strip()
 
 
-def get_video_metadata(video_path: str) -> tuple[float, float]:
-    """Get frame rate (fps) and duration (seconds) from video via ffprobe."""
+def get_audio_metadata(audio_path: str) -> tuple[float, float]:
+    """Get duration (seconds) and audio stream start_time via ffprobe."""
     output = run_command([
-        "ffprobe",
-        "-v", "error",
-        "-select_streams", "v:0",
-        "-show_entries", "stream=r_frame_rate",
-        "-show_entries", "format=duration",
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration:stream=start_time,codec_type",
         "-of", "json",
-        video_path,
+        audio_path,
     ])
     data = json.loads(output)
-    stream = data.get("streams", [{}])[0] if data.get("streams") else {}
-    fmt = data.get("format", {})
-
-    # Parse r_frame_rate (e.g. "30000/1001" for 29.97, "30/1" for 30)
-    r_fr = stream.get("r_frame_rate", "30/1")
-    if "/" in str(r_fr):
-        num, den = map(int, r_fr.split("/"))
-        fps = num / den if den else 30.0
-    else:
-        fps = float(r_fr) if r_fr else 30.0
-
-    duration = float(fmt.get("duration", 0) or 0)
-    return (fps, duration)
+    duration = float(data.get("format", {}).get("duration", 0) or 0)
+    # Find the audio stream start_time — can be non-zero in MP4s recorded by cameras
+    start_time = 0.0
+    for stream in data.get("streams", []):
+        if stream.get("codec_type") == "audio":
+            val = stream.get("start_time")
+            if val and val != "N/A":
+                start_time = float(val)
+            break
+    return (start_time, duration)
 
 
-def extract_audio(video_path: str, audio_path: str):
-    """Extract audio from video using ffmpeg, compress to mp3 for API upload."""
-    print(json.dumps({"status": "extracting_audio"}), flush=True)
-    subprocess.run(
-        [
-            "ffmpeg",
-            "-i",
-            video_path,
-            "-vn",
-            "-acodec",
-            "libmp3lame",
-            "-ar",
-            "16000",
-            "-ac",
-            "1",
-            "-b:a",
-            "128k",
-            audio_path,
-            "-y",
-        ],
-        capture_output=True,
-        check=True,
-    )
-    size_mb = os.path.getsize(audio_path) / (1024 * 1024)
-    print(json.dumps({"status": "audio_extracted", "size_mb": round(size_mb, 1)}), flush=True)
-
-
-def split_audio_if_needed(audio_path: str) -> (List[str], Optional[str]):
+def split_audio_if_needed(audio_path: str) -> tuple[List[str], Optional[str]]:
     size = os.path.getsize(audio_path)
     if size <= MAX_DEEPGRAM_FILE_SIZE:
         return [audio_path], None
 
     print(json.dumps({"status": "chunking_audio"}), flush=True)
-    temp_dir = tempfile.mkdtemp(prefix="section1-chunks-")
+    temp_dir = tempfile.mkdtemp(prefix="clipper-chunks-")
     pattern = os.path.join(temp_dir, FRAGMENT_TEMPLATE)
     subprocess.run(
         [
-            "ffmpeg",
-            "-i",
-            audio_path,
-            "-f",
-            "segment",
-            "-segment_time",
-            str(CHUNK_DURATION_SECONDS),
-            "-c:a",
-            "libmp3lame",
-            "-b:a",
-            "128k",
-            "-ar",
-            "16000",
-            "-ac",
-            "1",
-            pattern,
-            "-y",
+            "ffmpeg", "-i", audio_path,
+            "-f", "segment",
+            "-segment_time", str(CHUNK_DURATION_SECONDS),
+            "-c:a", "libmp3lame", "-b:a", "128k", "-ar", "16000", "-ac", "1",
+            pattern, "-y",
         ],
-        capture_output=True,
-        check=True,
+        capture_output=True, check=True,
     )
 
     chunks = sorted(Path(temp_dir).glob("chunk-*.mp3"))
     if not chunks:
         raise RuntimeError("Chunking produced no files")
 
-    chunk_paths = [str(chunk) for chunk in chunks]
-    total_chunks = len(chunk_paths)
-    print(json.dumps({"status": "chunking_complete", "chunks": total_chunks}), flush=True)
+    chunk_paths = [str(c) for c in chunks]
+    print(json.dumps({"status": "chunking_complete", "chunks": len(chunk_paths)}), flush=True)
     return chunk_paths, temp_dir
 
 
-def get_video_chunk_offsets(video_path: str, num_chunks: int) -> List[float]:
-    """Pre-compute per-chunk time offsets from the original video using ffprobe.
-
-    For each chunk index i, we probe the original video at
-    i * CHUNK_DURATION_SECONDS to get the exact audio packet timestamp at that
-    position.  This avoids the drift that accumulates when measuring re-encoded
-    MP3 chunk durations — especially noticeable for long files where small
-    per-chunk encoding errors stack up.
-    """
+def get_chunk_offsets(audio_path: str, num_chunks: int) -> List[float]:
     offsets: List[float] = []
     for i in range(num_chunks):
         target = i * CHUNK_DURATION_SECONDS
@@ -145,18 +85,16 @@ def get_video_chunk_offsets(video_path: str, num_chunks: int) -> List[float]:
             continue
         try:
             output = run_command([
-                "ffprobe",
-                "-v", "error",
+                "ffprobe", "-v", "error",
                 "-read_intervals", f"{target}%+#1",
                 "-show_entries", "packet=pts_time",
                 "-select_streams", "a:0",
                 "-of", "default=noprint_wrappers=1:nokey=1",
-                video_path,
+                audio_path,
             ])
             val = output.strip().split("\n")[0]
             offsets.append(float(val) if val and val != "N/A" else float(target))
         except Exception:
-            # Fall back to the nominal boundary if ffprobe fails for this chunk
             offsets.append(float(target))
     return offsets
 
@@ -200,42 +138,23 @@ def build_transcript_entries(chunk_data: dict, offset: float) -> List[dict]:
     return entries
 
 
-def transcribe(audio_path: str, video_path: str):
-    """Transcribe audio using Deepgram nova-3 with word-level timestamps."""
-
-    fps, video_duration = get_video_metadata(video_path)
-    client = get_deepgram_client()
+async def run_transcription(audio_path: str, audio_offset: float = 0.0) -> None:
+    """Single async entry point — all Deepgram calls happen here."""
+    _, duration = get_audio_metadata(audio_path)
     chunk_paths, chunk_dir = split_audio_if_needed(audio_path)
-
-    # Pre-compute offsets from the original video before entering the transcription
-    # loop.  Using chunk_index * CHUNK_DURATION_SECONDS probed against the source
-    # file avoids accumulated drift from measuring re-encoded MP3 chunk durations.
     total_chunks = len(chunk_paths)
-    if total_chunks > 1:
-        offsets = get_video_chunk_offsets(video_path, total_chunks)
-    else:
-        offsets = [0.0]
+    offsets = get_chunk_offsets(audio_path, total_chunks) if total_chunks > 1 else [0.0]
 
+    client = AsyncDeepgramClient(api_key=os.environ["DEEPGRAM_API_KEY"])
     transcript: List[dict] = []
     detected_language: Optional[str] = None
 
     try:
         for idx, chunk_path in enumerate(chunk_paths, start=1):
             print(
-                json.dumps(
-                    {
-                        "status": "transcribing_chunk",
-                        "chunk": idx,
-                        "total": total_chunks,
-                    }
-                ),
+                json.dumps({"status": "transcribing_chunk", "chunk": idx, "total": total_chunks}),
                 flush=True,
             )
-
-            offset = offsets[idx - 1]
-
-            with open(chunk_path, "rb") as chunk_file:
-                audio_bytes = chunk_file.read()
 
             transcribe_kwargs = dict(
                 model="nova-3",
@@ -245,18 +164,19 @@ def transcribe(audio_path: str, video_path: str):
                 diarize=True,
                 paragraphs=True,
             )
-            # Pass detected language to subsequent chunks so Deepgram doesn't
-            # waste cycles on language detection and diarization is more consistent.
             if detected_language:
                 transcribe_kwargs["language"] = detected_language
 
-            response = client.listen.v1.media.transcribe_file(
+            with open(chunk_path, "rb") as f:
+                audio_bytes = f.read()
+
+            response = await client.listen.v1.media.transcribe_file(
                 request=audio_bytes,
                 **transcribe_kwargs,
             )
 
             chunk_data = response.model_dump()
-            transcript.extend(build_transcript_entries(chunk_data, offset))
+            transcript.extend(build_transcript_entries(chunk_data, offsets[idx - 1] + audio_offset))
 
             if not detected_language:
                 channels = chunk_data.get("results", {}).get("channels", [])
@@ -266,8 +186,7 @@ def transcribe(audio_path: str, video_path: str):
         if chunk_dir and os.path.exists(chunk_dir):
             shutil.rmtree(chunk_dir)
 
-    # Use video duration from ffprobe (authoritative); fall back to transcript end if probe fails
-    duration = video_duration if video_duration > 0 else (transcript[-1]["end"] if transcript else 0)
+    duration = duration if duration > 0 else (transcript[-1]["end"] if transcript else 0)
 
     print(
         json.dumps(
@@ -275,7 +194,7 @@ def transcribe(audio_path: str, video_path: str):
                 "status": "done",
                 "transcript": transcript,
                 "duration": duration,
-                "fps": round(fps, 4),
+                "fps": 0,
                 "language": detected_language or "en",
                 "model": "deepgram:nova-3",
             }
@@ -284,35 +203,58 @@ def transcribe(audio_path: str, video_path: str):
     )
 
 
-def main():
+async def main() -> None:
     if len(sys.argv) < 2:
-        print(json.dumps({"error": "Usage: transcribe.py <video_path>"}), flush=True)
+        print(json.dumps({"error": "Usage: transcribe.py <audio_path>"}), flush=True)
         sys.exit(1)
 
-    video_path = sys.argv[1]
+    audio_path = sys.argv[1]
 
-    if not os.path.exists(video_path):
-        print(json.dumps({"error": f"File not found: {video_path}"}), flush=True)
+    if not os.path.exists(audio_path):
+        print(json.dumps({"error": f"File not found: {audio_path}"}), flush=True)
         sys.exit(1)
 
-    api_key = os.environ.get("DEEPGRAM_API_KEY")
-    if not api_key:
+    is_video = any(audio_path.lower().endswith(ext) for ext in VIDEO_EXTENSIONS)
+    is_audio = any(audio_path.lower().endswith(ext) for ext in AUDIO_EXTENSIONS)
+
+    if not is_audio and not is_video:
+        print(json.dumps({"error": "Unsupported file type. Please provide a video (mp4, mov) or audio file (mp3, wav, m4a, etc.)"}), flush=True)
+        sys.exit(1)
+
+    extracted_audio_path: Optional[str] = None
+    audio_offset = 0.0
+    if is_video:
+        print(json.dumps({"status": "extracting_audio"}), flush=True)
+        # Capture audio stream start_time before extraction so we can shift Deepgram timestamps
+        audio_start, _ = get_audio_metadata(audio_path)
+        audio_offset = audio_start
+        tmp = tempfile.mktemp(suffix=".mp3", prefix="clipper-audio-")
+        result = subprocess.run(
+            ["ffmpeg", "-i", audio_path, "-vn", "-ar", "16000", "-ac", "1", "-b:a", "128k",
+             "-avoid_negative_ts", "make_zero", tmp, "-y"],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            print(json.dumps({"error": f"ffmpeg audio extraction failed: {result.stderr.strip()}"}), flush=True)
+            sys.exit(1)
+        size_mb = round(os.path.getsize(tmp) / (1024 * 1024), 1)
+        print(json.dumps({"status": "audio_extracted", "size_mb": size_mb, "audio_offset": audio_offset}), flush=True)
+        extracted_audio_path = tmp
+        audio_path = tmp
+
+    if not os.environ.get("DEEPGRAM_API_KEY"):
         print(json.dumps({"error": "DEEPGRAM_API_KEY not set"}), flush=True)
         sys.exit(1)
 
-    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
-        audio_path = tmp.name
-
     try:
-        extract_audio(video_path, audio_path)
-        transcribe(audio_path, video_path)
+        await run_transcription(audio_path, audio_offset=audio_offset)
     except Exception as exc:
         print(json.dumps({"error": str(exc)}), flush=True)
         sys.exit(1)
     finally:
-        if os.path.exists(audio_path):
-            os.unlink(audio_path)
+        if extracted_audio_path and os.path.exists(extracted_audio_path):
+            os.unlink(extracted_audio_path)
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

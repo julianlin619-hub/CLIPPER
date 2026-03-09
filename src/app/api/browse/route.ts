@@ -21,14 +21,15 @@ export async function GET(req: NextRequest) {
           return null;
         }
       })
-      .filter(Boolean)
-      .sort((a: any, b: any) => {
+      .filter((x): x is NonNullable<typeof x> => x !== null)
+      .sort((a, b) => {
         if (a.type !== b.type) return a.type === "directory" ? -1 : 1;
         return a.name.localeCompare(b.name);
       });
 
     return NextResponse.json({ dir, entries, parent: path.dirname(dir) });
-  } catch (e: any) {
-    return NextResponse.json({ error: e.message }, { status: 500 });
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return NextResponse.json({ error: msg }, { status: 500 });
   }
 }

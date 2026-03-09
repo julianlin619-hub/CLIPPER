@@ -10,7 +10,6 @@ import {
   WordTiming,
   SpeakerMap,
 } from "@/lib/types";
-import { generateFCPXML } from "@/lib/xml";
 import { computeFinalClips } from "@/lib/export";
 import { autoDetectSpeakers } from "@/lib/speaker-utils";
 import FileBrowser from "@/components/file-browser";
@@ -157,17 +156,6 @@ export default function Home() {
     setStep("edit");
   };
 
-  const handleExport = () => {
-    const clips = computeFinalClips(editableWords);
-    const xml = generateFCPXML(clips, fileName, duration, fps);
-    const blob = new Blob([xml], { type: "application/xml" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `${fileName.replace(/\.\w+$/, "")}_edited.fcpxml`;
-    a.click();
-    URL.revokeObjectURL(url);
-  };
 
   const stepLabels: { key: AppStep; label: string }[] = [
     { key: "browse", label: "1. Transcribe" },
@@ -246,9 +234,11 @@ export default function Home() {
         {step === "export" && (
           <ExportStep
             words={editableWords}
+            segments={segments}
             fileName={fileName}
+            filePath={filePath}
+            fps={fps}
             duration={duration}
-            onExport={handleExport}
             transcript={transcript}
             fcpxmlPath={fcpxmlPath}
           />

@@ -48,8 +48,11 @@ const SEGMENT_BG_COLORS = [
 export default function VideoEditor({ words, segments = [], onChange, onContinue, videoSrc }: Props) {
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [activePage, setActivePage] = useState(0);
-  const videoRef = useRef<HTMLVideoElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const playBoundaryRef = useRef<number | null>(null);
+  const keptClipsRef = useRef<{ start: number; end: number }[]>([]);
+  const playableClipsRef = useRef<{ start: number; end: number }[]>([]);
 
   // Drag selection state (refs to avoid stale closures in event handlers)
   const isDragging = useRef(false);
@@ -61,33 +64,49 @@ export default function VideoEditor({ words, segments = [], onChange, onContinue
   const wordList = useMemo(() => words, [words]);
 
   // Skip removed regions during playback
-  const removedRanges = useMemo(() =>
-    words.filter((w) => w.removed).map((w) => ({ start: w.start, end: w.end })).sort((a, b) => a.start - b.start),
-    [words]
-  );
 
-  useEffect(() => {
-    const video = videoRef.current;
-    if (!video) return;
-    const handle = () => {
-      if (video.paused) return;
-      const t = video.currentTime;
-      for (const r of removedRanges) {
-        if (t >= r.start - 0.1 && t < r.end) { video.currentTime = r.end; break; }
-      }
-    };
-    video.addEventListener("timeupdate", handle);
-    return () => video.removeEventListener("timeupdate", handle);
-  }, [removedRanges]);
+  // Play from a given start time through end of segment (skipping removed words)
+  const playCurrentSegment = useCallback((fromTime?: number) => {
+    const seg = hasSegments ? segments[activePage] : null;
+    const segClips = seg
+      ? keptClipsRef.current.filter((clip) => clip.end > seg.start && clip.start < seg.end)
+      : keptClipsRef.current;
+    // If fromTime given, only play clips that start at or after that point
+    const clipsFromHere = fromTime != null
+      ? segClips.filter((clip) => clip.end > fromTime)
+      : segClips;
+    const start = fromTime != null
+      ? Math.max(fromTime, clipsFromHere[0]?.start ?? fromTime)
+      : (segClips[0]?.start ?? keptClipsRef.current[0]?.start ?? 0);
+    const end = segClips[segClips.length - 1]?.end ?? keptClipsRef.current[keptClipsRef.current.length - 1]?.end ?? 0;
+    if (start < end) playRange(start, end, clipsFromHere.length ? clipsFromHere : segClips);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activePage, segments, hasSegments]);
 
   // Keyboard: Backspace = cut, Escape = deselect, Cmd+Z handled by browser
   useEffect(() => {
     const handle = (e: KeyboardEvent) => {
       const tag = (e.target as HTMLElement)?.tagName;
       if (tag === "INPUT" || tag === "TEXTAREA") return;
-      if (e.key === "Backspace" || e.key === "Delete") {
+      if (e.key === " ") {
+        e.preventDefault();
+        if (videoRef.current?.paused === false) {
+          videoRef.current.pause();
+          playBoundaryRef.current = null;
+        } else {
+          // If a word is selected, play from that word's start time
+          const selectedWords = words.filter((w) => selectedIds.has(w.id));
+          const fromTime = selectedWords.length > 0
+            ? Math.min(...selectedWords.map((w) => w.start))
+            : undefined;
+          playCurrentSegment(fromTime);
+        }
+      } else if (e.key === "Backspace" || e.key === "Delete") {
         e.preventDefault();
         cutSelection();
+      } else if (e.key === "r" || e.key === "R") {
+        e.preventDefault();
+        restoreSelection();
       } else if (e.key === "Escape") {
         setSelectedIds(new Set());
       }
@@ -95,11 +114,96 @@ export default function VideoEditor({ words, segments = [], onChange, onContinue
     window.addEventListener("keydown", handle);
     return () => window.removeEventListener("keydown", handle);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedIds, words]);
+  }, [selectedIds, words, playCurrentSegment]);
 
-  const seekTo = (time: number) => {
-    if (videoRef.current) videoRef.current.currentTime = time;
-  };
+  // rAF-based playback loop: skip removed regions + respect selection boundary
+  useEffect(() => {
+    const el = videoRef.current;
+    if (!el) return;
+    const TOLERANCE = 0.05; // 50ms
+
+    let rafId = 0;
+
+    const tick = () => {
+      if (!el.paused) {
+        const t = el.currentTime;
+
+        // ── Skip-removed (reads playableClipsRef set by caller) ──────────
+        const clips = playableClipsRef.current;
+        if (clips.length) {
+          const inKept = clips.some((clip) => t >= clip.start - TOLERANCE && t < clip.end + TOLERANCE);
+          if (!inKept) {
+            const next = clips.find((clip) => clip.start > t + TOLERANCE);
+            if (next) {
+              // Re-check boundary before seeking to ensure we don't jump past it
+              if (playBoundaryRef.current !== null && next.start >= playBoundaryRef.current - TOLERANCE) {
+                el.pause();
+                playBoundaryRef.current = null;
+                rafId = requestAnimationFrame(tick);
+                return;
+              }
+              el.currentTime = next.start;
+            } else {
+              el.pause();
+              playBoundaryRef.current = null;
+              rafId = requestAnimationFrame(tick);
+              return;
+            }
+          }
+        }
+
+        // ── Boundary check (stop at segment/selection end) ────────────────
+        if (playBoundaryRef.current !== null && t >= playBoundaryRef.current - TOLERANCE) {
+          el.pause();
+          playBoundaryRef.current = null;
+        }
+      }
+      rafId = requestAnimationFrame(tick);
+    };
+
+    const onPlay  = () => {
+      // If no boundary set (native play button), use all kept clips
+      if (playBoundaryRef.current === null) playableClipsRef.current = keptClipsRef.current;
+      cancelAnimationFrame(rafId);
+      rafId = requestAnimationFrame(tick);
+    };
+    const onPause = () => { cancelAnimationFrame(rafId); };
+
+    el.addEventListener("play",  onPlay);
+    el.addEventListener("pause", onPause);
+    return () => {
+      el.removeEventListener("play",  onPlay);
+      el.removeEventListener("pause", onPause);
+      cancelAnimationFrame(rafId);
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const seekTo = useCallback((time: number) => {
+    const el = videoRef.current;
+    if (el) el.currentTime = Math.max(0, time);
+  }, []);
+
+  const playRange = useCallback((startTime: number, endTime: number, clips?: { start: number; end: number }[]) => {
+    const el = videoRef.current;
+    if (!el) return;
+    playBoundaryRef.current = endTime;
+    playableClipsRef.current = clips ?? keptClipsRef.current;
+    el.currentTime = Math.max(0, startTime);
+    el.play().catch(() => {});
+  }, []);
+
+  const getTimeRangeForIds = useCallback((ids: Set<string>): { start: number; end: number } | null => {
+    let start = Infinity;
+    let end = -Infinity;
+    for (const w of wordList) {
+      if (ids.has(w.id)) {
+        if (w.start < start) start = w.start;
+        if (w.end > end) end = w.end;
+      }
+    }
+    return start === Infinity ? null : { start, end };
+  }, [wordList]);
 
   // Groups
   const groups = useMemo<WordGroup[]>(() => {
@@ -122,6 +226,28 @@ export default function VideoEditor({ words, segments = [], onChange, onContinue
 
   const keptCount = useMemo(() => words.filter((w) => !w.removed).length, [words]);
   const exportDuration = useMemo(() => computeFinalClips(words).reduce((a, c) => a + (c.end - c.start), 0), [words]);
+
+  // Build sorted kept clips directly — merge consecutive non-removed words,
+  // splitting on any gap (removed word breaks the sequence).
+  // Gap threshold: 50ms to tolerate minor timestamp imprecision.
+  const keptClips = useMemo(() => {
+    const GAP = 0.05;
+    const kept = words.filter((w) => !w.removed).sort((a, b) => a.start - b.start);
+    const clips: { start: number; end: number }[] = [];
+    for (const w of kept) {
+      const last = clips[clips.length - 1];
+      if (last && w.start - last.end <= GAP) {
+        last.end = w.end;
+      } else {
+        clips.push({ start: w.start, end: w.end });
+      }
+    }
+    return clips;
+  }, [words]);
+  // Keep refs in sync so the rAF loop always sees latest clips without re-registering
+  keptClipsRef.current = keptClips;
+  // Only update playable if no active boundary (don't clobber a scoped playback)
+  if (playBoundaryRef.current === null) playableClipsRef.current = keptClips;
 
   // ── Selection actions ─────────────────────────────────────────────────────
 
@@ -156,24 +282,35 @@ export default function VideoEditor({ words, segments = [], onChange, onContinue
     const idx = getIdxFromId(wordId);
     isDragging.current = true;
     dragAnchorIdx.current = idx;
-    // Single click: select just this word (or shift-extend)
+    let newIds: Set<string>;
     if (e.shiftKey && selectedIds.size > 0) {
-      // Find current selection boundary and extend
       const existingIdxes = Array.from(selectedIds).map(getIdxFromId).filter((i) => i >= 0);
-      const anchorIdx = existingIdxes[0]; // use first as anchor
-      setSelectedIds(buildRangeIds(anchorIdx, idx));
+      const anchorIdx = existingIdxes[0];
+      newIds = buildRangeIds(anchorIdx, idx);
     } else {
-      setSelectedIds(new Set([wordId]));
+      newIds = new Set([wordId]);
     }
-    // Seek on click
-    const word = wordList[idx];
-    if (word) seekTo(word.start);
+    setSelectedIds(newIds);
+    const range = getTimeRangeForIds(newIds);
+    if (range) {
+      // Build clips from just the selected non-removed words
+      const selClips: { start: number; end: number }[] = [];
+      for (const w of wordList) {
+        if (!newIds.has(w.id) || w.removed) continue;
+        const last = selClips[selClips.length - 1];
+        if (last && w.start - last.end <= 0.05) { last.end = w.end; }
+        else selClips.push({ start: w.start, end: w.end });
+      }
+      playRange(range.start, range.end, selClips.length ? selClips : undefined);
+    }
   };
 
   const onWordMouseEnter = (e: React.MouseEvent, wordId: string) => {
     if (!isDragging.current) return;
     const idx = getIdxFromId(wordId);
-    setSelectedIds(buildRangeIds(dragAnchorIdx.current, idx));
+    const newIds = buildRangeIds(dragAnchorIdx.current, idx);
+    setSelectedIds(newIds);
+    void getTimeRangeForIds(newIds); // selection only, no playback
   };
 
   useEffect(() => {
@@ -185,6 +322,10 @@ export default function VideoEditor({ words, segments = [], onChange, onContinue
   const goToPage = (idx: number) => {
     setActivePage(idx);
     setSelectedIds(new Set());
+    // Scroll transcript back to top when switching segments
+    requestAnimationFrame(() => {
+      if (containerRef.current) containerRef.current.scrollTop = 0;
+    });
   };
 
   const activeSeg = hasSegments ? segments[activePage] : null;
@@ -197,11 +338,28 @@ export default function VideoEditor({ words, segments = [], onChange, onContinue
       <div className="flex items-center justify-between mb-3">
         <div className="flex items-center gap-3 flex-wrap">
           {/* Stats */}
-          <span className="text-sm text-neutral-300 font-medium">
-            {keptCount.toLocaleString()} words kept
-          </span>
+          <span className="text-sm text-neutral-400">Duration: ~{fmtDuration(exportDuration)}</span>
+
           <span className="text-neutral-700">·</span>
-          <span className="text-sm text-neutral-400">~{fmtDuration(exportDuration)}</span>
+
+          {/* Shortcut hints */}
+          <span className="flex items-center gap-1 text-xs text-neutral-600">
+            <kbd className="px-1.5 py-0.5 rounded bg-neutral-800 border border-neutral-700 font-sans text-red-400">⌫</kbd>
+            <span>Delete</span>
+          </span>
+          <span className="flex items-center gap-1 text-xs text-neutral-600">
+            <kbd className="px-1.5 py-0.5 rounded bg-neutral-800 border border-neutral-700 font-sans text-green-400">R</kbd>
+            <span>Restore</span>
+          </span>
+          <span className="flex items-center gap-1 text-xs text-neutral-600">
+            <kbd className="px-1.5 py-0.5 rounded bg-neutral-800 border border-neutral-700 font-sans text-green-400">Speaker</kbd>
+            <span>Restore line</span>
+          </span>
+          <span className="flex items-center gap-1 text-xs text-neutral-600">
+            <span>click word +</span>
+            <kbd className="px-1.5 py-0.5 rounded bg-neutral-800 border border-neutral-700 font-sans text-neutral-400">Space</kbd>
+            <span>= play from that point</span>
+          </span>
 
           {/* Selection actions */}
           {selectedIds.size > 0 && (
@@ -236,14 +394,29 @@ export default function VideoEditor({ words, segments = [], onChange, onContinue
 
         {/* Video panel */}
         {videoSrc && (
-          <div className="w-[36%] shrink-0 sticky top-0 self-start">
+          <div className="w-[38%] shrink-0 sticky top-0 self-start space-y-2">
             <video
               ref={videoRef}
               src={videoSrc}
               controls
-              className="w-full rounded-lg bg-black border border-neutral-800"
-              style={{ maxHeight: "calc(100vh - 260px)" }}
+              className="w-full rounded-lg bg-black"
             />
+            <button
+              onClick={() => {
+                const seg = activeSeg;
+                // Find kept clips that overlap this segment
+                playCurrentSegment();
+              }}
+              className="w-full py-2 rounded-lg bg-violet-600 hover:bg-violet-500 text-white text-sm font-semibold transition-colors"
+            >
+              ▶ Play Clip
+            </button>
+            <button
+              onClick={() => { videoRef.current?.pause(); playBoundaryRef.current = null; }}
+              className="w-full py-2 rounded-lg bg-neutral-800 hover:bg-neutral-700 text-neutral-300 text-sm font-semibold transition-colors"
+            >
+              ⏸ Pause
+            </button>
           </div>
         )}
 
@@ -319,7 +492,13 @@ export default function VideoEditor({ words, segments = [], onChange, onContinue
                         {fmt(groupStart)} – {fmt(groupEnd)}
                       </button>
                       {group.speaker != null && (
-                        <span className="text-[11px] text-neutral-700">Speaker {group.speaker}</span>
+                        <button
+                          onClick={() => onChange(words.map((w) => group.words.some((gw) => gw.id === w.id) ? { ...w, removed: false } : w))}
+                          className="text-[11px] text-neutral-700 hover:text-green-400 transition-colors"
+                          title="Restore entire utterance"
+                        >
+                          Speaker {group.speaker}
+                        </button>
                       )}
                     </div>
 

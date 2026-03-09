@@ -40,3 +40,7 @@ yarn-error.log*
 *.tsbuildinfo
 next-env.d.ts
 debug-last-run.txt
+
+# python
+scripts/__pycache__/
+*.pyc

@@ -1,4 +1,5 @@
-import { EditableWord, TranscriptEntry } from "@/lib/types";
+import { EditableWord, SegmentGroup, TranscriptEntry } from "@/lib/types";
+import { getFrameTimeFormat } from "@/lib/timecode";
 
 function fmt(seconds: number): string {
   const m = Math.floor(seconds / 60);
@@ -229,75 +230,6 @@ function buildSpeakerTurns(
 }
 
 
-// ─── SRT caption export ───────────────────────────────────────────────────────
-
-/**
- * Format seconds as SRT timestamp: HH:MM:SS,mmm
- */
-function fmtSRT(seconds: number): string {
-  const h = Math.floor(seconds / 3600);
-  const m = Math.floor((seconds % 3600) / 60);
-  const s = Math.floor(seconds % 60);
-  const ms = Math.round((seconds % 1) * 1000);
-  return `${h.toString().padStart(2, "0")}:${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")},${ms.toString().padStart(3, "0")}`;
-}
-
-/**
- * Generate an SRT subtitle file from the kept words.
- *
- * Each contiguous run of kept words becomes one or more subtitle entries.
- * Long clips (> MAX_CAPTION_WORDS words) are split so captions stay
- * readable on screen. Timecodes are word-level for accurate in/out points.
- */
-export function generateSRT(words: EditableWord[]): string {
-  const MAX_CAPTION_WORDS = 3;
-
-  // Compute timeline-relative timecodes by subtracting only the time removed
-  // by cuts — natural gaps between words within a clip are preserved so
-  // captions stay in sync with the sewn-together video.
-  let offset = 0;
-  let lastKeptEnd: number | null = null;
-  let inCut = false;
-
-  const timedKept: { text: string; start: number; end: number }[] = [];
-
-  for (const word of words) {
-    if (word.removed) {
-      if (!inCut && lastKeptEnd !== null) {
-        // entering a cut — record where the gap starts
-        inCut = true;
-      }
-    } else {
-      if (inCut && lastKeptEnd !== null) {
-        // leaving a cut — the gap from lastKeptEnd to word.start is removed footage
-        offset += word.start - lastKeptEnd;
-        inCut = false;
-      }
-      timedKept.push({
-        text: word.text,
-        start: word.start - offset,
-        end: word.end - offset,
-      });
-      lastKeptEnd = word.end;
-    }
-  }
-
-  // Chunk into captions of MAX_CAPTION_WORDS
-  const captionChunks: { start: number; end: number; text: string }[] = [];
-  for (let i = 0; i < timedKept.length; i += MAX_CAPTION_WORDS) {
-    const slice = timedKept.slice(i, i + MAX_CAPTION_WORDS);
-    captionChunks.push({
-      start: slice[0].start,
-      end: slice[slice.length - 1].end,
-      text: slice.map((w) => w.text).join(" "),
-    });
-  }
-
-  // {\an5} = SubStation Alpha center-screen alignment, supported by DaVinci Resolve
-  return captionChunks
-    .map((c, i) => `${i + 1}\n${fmtSRT(c.start)} --> ${fmtSRT(c.end)}\n${c.text}`)
-    .join("\n\n");
-}
 
 // ─── Public generators ────────────────────────────────────────────────────────
 
@@ -334,4 +266,193 @@ export function generateExampleDecisions(
       return `[${t.turnIdx}] TRIM: ${t.keptText}`;
     })
     .join("\n");
+}
+
+// ─── XML alignment debug ─────────────────────────────────────────────────────
+
+function toFrames(seconds: number, fps: number): number {
+  return Math.round(seconds * fps);
+}
+
+function fmtFrameTime(frames: number, fps: number, frameDenom: number, frameNum: number): string {
+  const secs = (frames / fps).toFixed(3);
+  return `${frames * frameNum}/${frameDenom}s  (frame ${frames}, ${secs}s)`;
+}
+
+/**
+ * Generate a word-level XML alignment debug file.
+ * For every word shows: kept/cut status, source frame range, timeline offset,
+ * and which clip number it lands in — so you can trace exactly how words
+ * map into the FCPXML timeline.
+ */
+export function generateXmlAlignmentDebug(
+  words: EditableWord[],
+  fileName: string,
+  duration: number,
+  fps: number = 30
+): string {
+  const ntsc2997 = Math.abs(fps - 29.97) < 0.02;
+  const ntsc5994 = Math.abs(fps - 59.94) < 0.02;
+  let frameNum: number, frameDenom: number, frameDuration: string;
+  if (ntsc2997) {
+    frameNum = 1001; frameDenom = 30000; frameDuration = "1001/30000s";
+  } else if (ntsc5994) {
+    frameNum = 1001; frameDenom = 60000; frameDuration = "1001/60000s";
+  } else {
+    const effectiveFps = Math.round(fps);
+    frameDenom = effectiveFps * 100;
+    frameNum = 100;
+    frameDuration = `100/${frameDenom}s`;
+  }
+
+  const clips = computeFinalClips(words);
+  const assetDurFrames = Math.ceil(duration * fps);
+
+  // Map word id → clip index
+  const wordToClip = new Map<string, number>();
+  {
+    let clipIdx = 0;
+    let inClip = false;
+    for (const word of words) {
+      if (!word.removed) {
+        if (!inClip) { inClip = true; }
+        wordToClip.set(word.id, clipIdx);
+      } else {
+        if (inClip) { clipIdx++; inClip = false; }
+      }
+    }
+  }
+
+  // Pre-compute per-clip timeline offset (in frames)
+  const clipOffsets: number[] = [];
+  let offsetFrames = 0;
+  for (let i = 0; i < clips.length; i++) {
+    clipOffsets.push(offsetFrames);
+    const startF = toFrames(clips[i].start, fps);
+    const rawEnd = Math.ceil(clips[i].end * fps);
+    const endF = i === clips.length - 1 ? Math.min(rawEnd, assetDurFrames) : rawEnd;
+    offsetFrames += Math.max(1, endF - startF);
+  }
+
+  const hr = "─".repeat(90);
+  const dhr = "═".repeat(90);
+  const lines: string[] = [];
+
+  lines.push("CLIPPER — XML ALIGNMENT DEBUG");
+  lines.push(dhr);
+  lines.push(`File:         ${fileName}`);
+  lines.push(`Duration:     ${fmt(duration)}`);
+  lines.push(`FPS:          ${fps}  (frameDuration=${frameDuration})`);
+  lines.push(`Asset frames: ${assetDurFrames}  = ${assetDurFrames * frameNum}/${frameDenom}s`);
+  lines.push(`Total words:  ${words.length}  |  Output clips: ${clips.length}`);
+  lines.push("");
+  lines.push("CLIP SUMMARY");
+  lines.push(hr);
+
+  for (let i = 0; i < clips.length; i++) {
+    const c = clips[i];
+    const startF = toFrames(c.start, fps);
+    const rawEnd = Math.ceil(c.end * fps);
+    const endF = i === clips.length - 1 ? Math.min(rawEnd, assetDurFrames) : rawEnd;
+    const dur = Math.max(1, endF - startF);
+    lines.push(`Clip #${String(i + 1).padStart(3, "0")}  source [${startF}→${endF}]  dur=${dur}f  timeline_offset=${clipOffsets[i]}f`);
+    lines.push(`         FCPXML: start="${startF * frameNum}/${frameDenom}s"  duration="${dur * frameNum}/${frameDenom}s"  offset="${clipOffsets[i] * frameNum}/${frameDenom}s"`);
+    lines.push(`         text: "${c.text.substring(0, 100)}"`);
+    lines.push("");
+  }
+
+  lines.push(dhr);
+  lines.push("WORD-BY-WORD ALIGNMENT");
+  lines.push("  STATUS   CLIP  | SRC_START→SRC_END (frames / seconds)      | TIMELINE_OUT_FRAME | WORD");
+  lines.push(hr);
+
+  let prevClipIdx = -1;
+  let wordInClip = 0;
+
+  for (const word of words) {
+    const startF = toFrames(word.start, fps);
+    const endF = Math.ceil(word.end * fps);
+
+    if (word.removed) {
+      lines.push(
+        `  [CUT]   ----  | ${String(startF).padStart(6)}→${String(endF).padStart(6)}` +
+        `  (${word.start.toFixed(3)}s→${word.end.toFixed(3)}s)  | ------             | "${word.text}"`
+      );
+    } else {
+      const clipIdx = wordToClip.get(word.id) ?? 0;
+
+      if (clipIdx !== prevClipIdx) {
+        if (prevClipIdx !== -1) lines.push("");
+        lines.push(
+          `  ┌── CLIP #${String(clipIdx + 1).padStart(3, "0")}  ` +
+          `FCPXML offset="${clipOffsets[clipIdx] * frameNum}/${frameDenom}s"  ` +
+          `(frame ${clipOffsets[clipIdx]})  source_start="${toFrames(clips[clipIdx].start, fps) * frameNum}/${frameDenom}s"`
+        );
+        prevClipIdx = clipIdx;
+        wordInClip = 0;
+      }
+
+      wordInClip++;
+      const clipSrcStart = toFrames(clips[clipIdx].start, fps);
+      const wordOffsetInClip = startF - clipSrcStart;
+      const wordTimelineFrame = clipOffsets[clipIdx] + wordOffsetInClip;
+
+      lines.push(
+        `  [KEPT]  #${String(clipIdx + 1).padStart(3, "0")}  | ${String(startF).padStart(6)}→${String(endF).padStart(6)}` +
+        `  (${word.start.toFixed(3)}s→${word.end.toFixed(3)}s)  | ≈${String(wordTimelineFrame).padStart(6)}f          | w${wordInClip}: "${word.text}"`
+      );
+    }
+  }
+
+  lines.push(hr);
+  lines.push(`END — ${clips.length} clips | ${words.filter(w => !w.removed).length} kept words | ${words.filter(w => w.removed).length} cut words`);
+
+  return lines.join("\n");
+}
+
+// ─── Segment-aware clip grouping ──────────────────────────────────────────────
+
+/**
+ * Split kept words by topic segment, then compute final clips per segment.
+ *
+ * Each SegmentGroup has start/end timestamps. Words whose start time falls
+ * within [segment.start, segment.end) are assigned to that segment.
+ * Words that fall outside all segments go into the nearest segment by proximity.
+ *
+ * Returns one array of clips per segment (empty arrays preserved so gap
+ * positions stay correct even if a segment was fully cut).
+ */
+export function computeClipsPerSegment(
+  words: EditableWord[],
+  segments: SegmentGroup[]
+): { start: number; end: number; text: string }[][] {
+  if (segments.length === 0) return [computeFinalClips(words)];
+
+  const groups: EditableWord[][] = segments.map(() => []);
+
+  for (const word of words) {
+    // Find which segment this word's start time belongs to
+    let assigned = -1;
+    for (let i = 0; i < segments.length; i++) {
+      if (word.start >= segments[i].start && word.start < segments[i].end) {
+        assigned = i;
+        break;
+      }
+    }
+    // Fallback: nearest segment by midpoint distance
+    if (assigned === -1) {
+      let minDist = Infinity;
+      for (let i = 0; i < segments.length; i++) {
+        const mid = (segments[i].start + segments[i].end) / 2;
+        const dist = Math.abs(word.start - mid);
+        if (dist < minDist) {
+          minDist = dist;
+          assigned = i;
+        }
+      }
+    }
+    if (assigned >= 0) groups[assigned].push(word);
+  }
+
+  return groups.map((g) => computeFinalClips(g));
 }

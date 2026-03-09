@@ -15,9 +15,7 @@ interface Props {
   onComplete: (decisions: LineDecision[]) => void;
 }
 
-const MODELS = [
-  { value: "claude-sonnet-4-20250514", label: "Claude Sonnet 4.6" },
-];
+const DEFAULT_MODEL = "claude-sonnet-4-20250514";
 
 type PromptMode = "default" | "custom";
 
@@ -33,7 +31,6 @@ interface SegGroupStatus {
 export default function PromptStep({ transcript, segments, speakerMap, onComplete }: Props) {
   const [mode, setMode] = useState<PromptMode>("default");
   const [customPrompt, setCustomPrompt] = useState("");
-  const [model, setModel] = useState(MODELS[0].value);
   const [loading, setLoading] = useState(false);
   const [groupStatuses, setGroupStatuses] = useState<SegGroupStatus[]>([]);
 
@@ -68,7 +65,7 @@ export default function PromptStep({ transcript, segments, speakerMap, onComplet
             lines,
             startLine,
             activePrompt,
-            model,
+            DEFAULT_MODEL,
             group.title,
             group.summary,
             speakerMap
@@ -104,7 +101,7 @@ export default function PromptStep({ transcript, segments, speakerMap, onComplet
           transcript,
           0,
           activePrompt,
-          model,
+          DEFAULT_MODEL,
           undefined,
           undefined,
           speakerMap
@@ -130,7 +127,7 @@ export default function PromptStep({ transcript, segments, speakerMap, onComplet
 
     setLoading(false);
     onComplete(allDecisions);
-  }, [activePrompt, model, transcript, segments, hasSegments, onComplete]);
+  }, [activePrompt, transcript, segments, hasSegments, onComplete]);
 
   const doneCount = groupStatuses.filter(
     (s) => s.state === "done" || s.state === "error"
@@ -196,22 +193,6 @@ export default function PromptStep({ transcript, segments, speakerMap, onComplet
             />
           </>
         )}
-
-        <label className="block text-sm font-medium text-neutral-300 mb-2">
-          Model
-        </label>
-        <select
-          value={model}
-          onChange={(e) => setModel(e.target.value)}
-          className="w-full bg-neutral-950 border border-neutral-700 text-white rounded-md px-3 py-2 text-sm mb-4"
-          disabled={loading}
-        >
-          {MODELS.map((m) => (
-            <option key={m.value} value={m.value}>
-              {m.label}
-            </option>
-          ))}
-        </select>
 
         <Button
           onClick={handleProcess}

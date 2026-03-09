@@ -143,7 +143,7 @@ export function generateDebugTXT(
 
 // ─── Speaker-turn helpers ────────────────────────────────────────────────────
 
-interface SpeakerTurn {
+export interface SpeakerTurn {
   turnIdx: number;
   speaker: string;
   originalText: string; // full merged text of all utterances in this turn
@@ -266,6 +266,17 @@ export function generateExampleDecisions(
       return `[${t.turnIdx}] TRIM: ${t.keptText}`;
     })
     .join("\n");
+}
+
+/**
+ * Return structured speaker turns for a segment — used for rendering the
+ * line-by-line KEEP/REMOVE/TRIM review on the export page.
+ */
+export function getSegmentTurns(
+  transcript: TranscriptEntry[],
+  words: EditableWord[]
+): SpeakerTurn[] {
+  return buildSpeakerTurns(transcript, words);
 }
 
 // ─── XML alignment debug ─────────────────────────────────────────────────────

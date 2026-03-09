@@ -2,7 +2,8 @@
 
 import { useState } from "react";
 import { EditableWord, SegmentGroup, TranscriptEntry } from "@/lib/types";
-import { computeClipsPerSegment } from "@/lib/export";
+import { computeClipsPerSegment, generateExampleTranscript, generateExampleDecisions } from "@/lib/export";
+import { Download } from "lucide-react";
 
 interface Props {
   words: EditableWord[];
@@ -15,21 +16,35 @@ interface Props {
   fcpxmlPath?: string;
 }
 
-export default function ExportStep({ words, segments = [], fileName, duration, fps = 30, fcpxmlPath }: Props) {
+export default function ExportStep({ words, segments = [], fileName, duration, fps = 30, fcpxmlPath, transcript = [] }: Props) {
   const segmentGroups = computeClipsPerSegment(words, segments);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const baseName = fileName.replace(/\.\w+$/, "");
 
-  const downloadFile = (content: string, name: string, mime = "text/plain") => {
-    const blob = new Blob([content], { type: mime });
+  const exampleCount = segments.length > 0 ? segments.length : 1;
+
+  const downloadExample = (segIdx: number) => {
+    const seg = segments.length > 0 ? segments[segIdx] : null;
+    const startIdx = seg?.startLine ?? 0;
+    const endIdx = seg?.endLine ?? transcript.length - 1;
+    const segTranscript = seg ? transcript.slice(startIdx, endIdx + 1) : transcript;
+    const segWords = words
+      .filter((w) => w.utteranceIdx >= startIdx && w.utteranceIdx <= endIdx)
+      .map((w) => ({ ...w, utteranceIdx: w.utteranceIdx - startIdx }));
+    const rawBlock = generateExampleTranscript(segTranscript, segWords);
+    const decisionsBlock = generateExampleDecisions(segWords, segTranscript);
+    const output = 'RAW TRANSCRIPT:\n\n' + rawBlock + '\n\nDECISIONS:\n\n' + decisionsBlock + '\n';
+    const label = seg?.title ? seg.title.replace(/\s+/g, '-').toLowerCase() : 'full';
+    const blob = new Blob([output], { type: 'text/plain' });
     const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
+    const a = document.createElement('a');
     a.href = url;
-    a.download = name;
+    a.download = 'example-' + label + '.txt';
     a.click();
     URL.revokeObjectURL(url);
   };
+
   const keptSegmentGroups = segmentGroups.map(group =>
     group.map(c => ({ start: c.start, end: c.end }))
   );
@@ -52,9 +67,9 @@ export default function ExportStep({ words, segments = [], fileName, duration, f
               });
               if (!res.ok) { const e = await res.json().catch(() => ({ error: res.statusText })); throw new Error(e.error); }
               const blob = new Blob([await res.text()], { type: "application/xml" });
-              const a = Object.assign(document.createElement("a"), { href: URL.createObjectURL(blob), download: `${baseName}_master.fcpxml` });
+              const a = Object.assign(document.createElement("a"), { href: URL.createObjectURL(blob), download: baseName + '_master.fcpxml' });
               a.click();
-            } catch (e: unknown) { setError(e instanceof Error ? e.message : String(e)); }
+            } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
             finally { setLoading(false); }
           }}
           disabled={loading || !fcpxmlPath}
@@ -68,8 +83,36 @@ export default function ExportStep({ words, segments = [], fileName, duration, f
             {loading ? "⏳" : "⬇"}
           </span>
         </button>
-
         {error && <p className="text-sm text-red-400 px-1">{error}</p>}
+      </div>
+
+      <div className="mt-8">
+        <div className="mb-3">
+          <h3 className="text-sm font-semibold text-neutral-300">Prompt Examples</h3>
+          <p className="text-xs text-neutral-500 mt-0.5">
+            Download a before/after example file for each segment — paste into the prompt to improve future edits.
+          </p>
+        </div>
+        <div className="space-y-2">
+          {Array.from({ length: exampleCount }, (_, i) => {
+            const seg = segments[i];
+            const label = seg?.title || (exampleCount === 1 ? 'Full Transcript' : 'Segment ' + (i + 1));
+            const filename = 'example-' + (seg?.title ? seg.title.replace(/\s+/g, '-').toLowerCase() : 'full') + '.txt';
+            return (
+              <button
+                key={i}
+                onClick={() => downloadExample(i)}
+                className="w-full flex items-center justify-between px-4 py-3 rounded-lg border border-neutral-700 bg-neutral-900 hover:bg-neutral-800 hover:border-neutral-500 transition-all group"
+              >
+                <div className="text-left">
+                  <p className="text-sm font-medium text-neutral-200">{label}</p>
+                  <p className="text-xs text-neutral-500 mt-0.5">{filename}</p>
+                </div>
+                <Download className="w-4 h-4 text-neutral-500 group-hover:text-neutral-200 transition-colors shrink-0" />
+              </button>
+            );
+          })}
+        </div>
       </div>
     </div>
   );

@@ -12,6 +12,45 @@ const TEMPERATURE = 0.3;
 const FRAGMENT_VALIDATION_MODEL = "claude-sonnet-4-20250514";
 const FRAGMENT_VALIDATION_SYSTEM = `You are a grammar checker. For each numbered text fragment below, reply with VALID if it begins as a grammatically complete sentence (or a self-contained clause that could open a spoken monologue), or FRAGMENT if it starts mid-sentence or mid-clause (e.g. begins with a lowercase preposition, a dependent clause opener, or is clearly the tail of a prior sentence). Reply ONLY in the format [index] VALID or [index] FRAGMENT, one per line. No explanations.`;
 
+const COMPREHENSION_SYSTEM = `You are a content analyst. Read the following conversation transcript and return a brief structured analysis in 3–5 sentences:
+1. The core problem or goal being discussed
+2. The key turning point, reframe, or insight
+3. The resolution or main takeaway (be specific and concrete — include any numbers, frameworks, or named tactics if present)
+
+This analysis will be used to guide editorial decisions. Do not editorialize or add opinions. Be concise and factual.`;
+
+/**
+ * Run a comprehension pass on a segment's lines.
+ * Returns a short natural-language summary of the arc, or null on failure.
+ * Non-blocking: failures fall back to null (editing proceeds without context).
+ */
+async function runComprehensionPass(
+  lines: TranscriptEntry[],
+  model: string
+): Promise<string | null> {
+  try {
+    const prose = lines
+      .map((l) => l.text.trim())
+      .filter(Boolean)
+      .join(' ');
+
+    const anthropic = new Anthropic();
+    const result = await anthropic.messages.create({
+      model,
+      max_tokens: 512,
+      temperature: 0,
+      system: COMPREHENSION_SYSTEM,
+      messages: [{ role: 'user', content: prose }],
+    });
+
+    const block = result.content[0];
+    return block.type === 'text' ? block.text.trim() : null;
+  } catch (err) {
+    console.warn('Comprehension pass failed (skipping):', err);
+    return null;
+  }
+}
+
 /**
  * Call an LLM (Claude or OpenAI) and return the text response.
  */
@@ -172,6 +211,11 @@ export async function processSegmentGroup(
     speaker: l.words?.[0]?.speaker ?? null,
   }));
 
+  // ── Comprehension pass (non-blocking) ──────────────────────────────────
+  // Read the segment as flowing prose first, so the edit LLM has global
+  // context about the arc before making per-utterance decisions.
+  const comprehensionSummary = await runComprehensionPass(lines, model);
+
   const creativeMessage = buildCreativeMessage(
     indexedLines,
     segmentTitle,
@@ -179,18 +223,44 @@ export async function processSegmentGroup(
     speakerMap
   );
 
+  // Prepend the comprehension summary as context for the editing pass.
+  const editMessage = comprehensionSummary
+    ? `## Global Arc Summary (read before editing)
+${comprehensionSummary}
+
+${creativeMessage}`
+    : creativeMessage;
+
+  console.log('[DEBUG-PIPELINE] ── processSegmentGroup ──────────────────────────');
+  console.log('[DEBUG-PIPELINE] SYSTEM PROMPT:\n' + editPrompt);
+  console.log('[DEBUG-PIPELINE] USER MESSAGE:\n' + editMessage);
+
   const rawOutput = await callLLM(
     model,
     editPrompt,
-    creativeMessage,
+    editMessage,
     TEMPERATURE
   );
+
+  console.log('[DEBUG-PIPELINE] RAW LLM RESPONSE:\n' + rawOutput);
 
   if (!rawOutput.trim()) {
     throw new Error("LLM returned empty response");
   }
 
   const { decisions, missingIndices } = parseIndexedDecisions(rawOutput, lines.length, startLineIndex);
+
+  console.log('[DEBUG-PIPELINE] PARSED DECISIONS (' + decisions.length + ' total):');
+  decisions.forEach((d) => {
+    if (d.action === 'trim') {
+      console.log(`[DEBUG-PIPELINE]   [${d.index}] TRIM: ${d.text}`);
+    } else {
+      console.log(`[DEBUG-PIPELINE]   [${d.index}] ${d.action.toUpperCase()}`);
+    }
+  });
+  if (missingIndices && missingIndices.length > 0) {
+    console.log('[DEBUG-PIPELINE] MISSING INDICES (defaulted to KEEP): ' + missingIndices.join(', '));
+  }
 
   // ── Fragment validation (non-blocking) ───────────────────────────────────
   await validateFragments(decisions, lines);
@@ -212,8 +282,11 @@ export async function processSegmentGroup(
     .join("\n");
 
   const logContent = [
+    "════════════════ COMPREHENSION SUMMARY ════════════════",
+    comprehensionSummary ?? "(skipped)",
+    "",
     "════════════════ INPUT ════════════════",
-    creativeMessage,
+    editMessage,
     "",
     "════════════════ RAW LLM OUTPUT ════════════════",
     rawOutput,

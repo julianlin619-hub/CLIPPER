@@ -152,6 +152,15 @@ export async function validateAssembledOutput(
 ): Promise<ValidationResult> {
   if (clips.length === 0) return { removeClips: [], flagClips: [] };
 
+  console.log('[DEBUG-PIPELINE] ── validateAssembledOutput ──────────────────────');
+  console.log('[DEBUG-PIPELINE] clips received: ' + clips.length);
+  clips.forEach((c) => {
+    const words = c.text.split(/\s+/);
+    const first10 = words.slice(0, 10).join(' ');
+    const last10  = words.slice(-10).join(' ');
+    console.log(`[DEBUG-PIPELINE]   clip[${c.clipIndex}] first10: "${first10}" | last10: "${last10}"`);
+  });
+
   try {
     const anthropic = new Anthropic();
     const allRemove: number[] = [];
@@ -171,7 +180,9 @@ export async function validateAssembledOutput(
     for (const chunk of chunks) {
       const userMessage = buildUserMessage(chunk);
       const responseText = await callWithRetry(anthropic, userMessage);
+      console.log('[DEBUG-PIPELINE] VALIDATOR chunk (' + chunk.length + ' clips) raw response:\n' + responseText);
       const { remove, flag } = parseResponse(responseText);
+      console.log('[DEBUG-PIPELINE] VALIDATOR parsed: REMOVE=' + JSON.stringify(remove) + ' FLAG=' + JSON.stringify(flag));
       allRemove.push(...remove);
       allFlag.push(...flag);
     }

@@ -270,7 +270,7 @@ export default function PromptStep({
 
     // Flatten results in segment order and hand off
     const allDecisions = resultsByIndex.flat();
-    setLoading(false);
+setLoading(false);
     onComplete(allDecisions);
   }, [activePrompt, transcript, segments, hasSegments, speakerMap, onComplete]);
 

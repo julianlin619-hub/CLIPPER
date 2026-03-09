@@ -9,6 +9,9 @@ import { join } from "path";
 
 const TEMPERATURE = 0.3;
 
+const FRAGMENT_VALIDATION_MODEL = "claude-sonnet-4-20250514";
+const FRAGMENT_VALIDATION_SYSTEM = `You are a grammar checker. For each numbered text fragment below, reply with VALID if it begins as a grammatically complete sentence (or a self-contained clause that could open a spoken monologue), or FRAGMENT if it starts mid-sentence or mid-clause (e.g. begins with a lowercase preposition, a dependent clause opener, or is clearly the tail of a prior sentence). Reply ONLY in the format [index] VALID or [index] FRAGMENT, one per line. No explanations.`;
+
 /**
  * Call an LLM (Claude or OpenAI) and return the text response.
  */
@@ -40,6 +43,110 @@ async function callLLM(
       ],
     });
     return result.choices[0]?.message?.content ?? "";
+  }
+}
+
+/**
+ * Validate boundary lines (TRIM outputs and KEEPs that follow a REMOVE) for
+ * mid-sentence fragments. Mutates decisions in place by setting fragmentWarning=true
+ * on any line flagged as FRAGMENT. Non-blocking: failures are silently swallowed.
+ */
+/**
+ * Count total words across a slice of TranscriptEntry lines.
+ */
+function transcriptWordCount(lines: TranscriptEntry[], startIdx: number, endIdx: number): number {
+  let count = 0;
+  for (let k = startIdx; k <= endIdx && k < lines.length; k++) {
+    count += (lines[k]?.text ?? "").split(/\s+/).filter(Boolean).length;
+  }
+  return count;
+}
+
+async function validateFragments(
+  decisions: LineDecision[],
+  lines: TranscriptEntry[]
+): Promise<void> {
+  // Collect boundary lines: TRIM outputs + KEEP lines that follow a *substantial* REMOVE.
+  // "Substantial" means the removed run has >= 5 words total in the source transcript.
+  // This prevents trivial noise clips like "in sorry." or "Okay." from masking real boundaries.
+  const boundaries: { index: number; text: string }[] = [];
+
+  for (let i = 0; i < decisions.length; i++) {
+    const d = decisions[i];
+    if (d.action === "remove") continue;
+
+    const outputText =
+      d.action === "trim" ? (d.text ?? lines[i]?.text ?? "") : (lines[i]?.text ?? "");
+
+    const isTrim = d.action === "trim";
+
+    // Walk backward over the preceding REMOVE run, skipping trivial gaps,
+    // to find the last substantial removed block (>= 5 words).
+    let prevIsSubstantialRemove = false;
+    if (i > 0 && decisions[i - 1].action === "remove") {
+      // Find the full preceding remove run
+      let runEnd = i - 1;
+      let runStart = runEnd;
+      while (runStart > 0 && decisions[runStart - 1].action === "remove") runStart--;
+
+      const removedWords = transcriptWordCount(lines, runStart, runEnd);
+
+      if (removedWords >= 5) {
+        // Substantial remove — this is a real boundary
+        prevIsSubstantialRemove = true;
+      } else {
+        // Trivial remove (noise/filler) — look further back for the last kept line
+        // and check whether THAT was preceded by a substantial remove.
+        // If so, the current KEEP line is still a boundary fragment.
+        let lookback = runStart - 1;
+        while (lookback >= 0 && decisions[lookback].action !== "remove") lookback--;
+        if (lookback >= 0) {
+          let lb_end = lookback;
+          let lb_start = lb_end;
+          while (lb_start > 0 && decisions[lb_start - 1].action === "remove") lb_start--;
+          const lb_words = transcriptWordCount(lines, lb_start, lb_end);
+          if (lb_words >= 5) prevIsSubstantialRemove = true;
+        }
+      }
+    }
+
+    if (isTrim || prevIsSubstantialRemove) {
+      boundaries.push({ index: d.index, text: outputText });
+    }
+  }
+
+  if (boundaries.length === 0) return;
+
+  try {
+    const anthropic = new Anthropic();
+    const userMessage = boundaries.map((b) => `[${b.index}] ${b.text}`).join("\n");
+
+    const result = await anthropic.messages.create({
+      model: FRAGMENT_VALIDATION_MODEL,
+      max_tokens: 1024,
+      temperature: 0,
+      system: FRAGMENT_VALIDATION_SYSTEM,
+      messages: [{ role: "user", content: userMessage }],
+    });
+
+    const responseText =
+      result.content[0]?.type === "text" ? result.content[0].text : "";
+
+    const decisionMap = new Map(decisions.map((d) => [d.index, d]));
+    const linePattern = /^\[(\d+)\]\s+(VALID|FRAGMENT)$/im;
+
+    for (const line of responseText.split("\n")) {
+      const match = line.trim().match(linePattern);
+      if (!match) continue;
+      const idx = parseInt(match[1], 10);
+      if (match[2].toUpperCase() === "FRAGMENT") {
+        const d = decisionMap.get(idx);
+        if (d) d.fragmentWarning = true;
+      }
+    }
+  } catch (err) {
+    // Validation is non-blocking — log and continue
+    console.warn("Fragment validation failed (skipping):", err);
   }
 }
 
@@ -83,9 +190,14 @@ export async function processSegmentGroup(
     throw new Error("LLM returned empty response");
   }
 
-  const decisions = parseIndexedDecisions(rawOutput, lines.length, startLineIndex);
+  const { decisions, missingIndices } = parseIndexedDecisions(rawOutput, lines.length, startLineIndex);
 
-  // ── Debug log ──
+  // ── Fragment validation (non-blocking) ───────────────────────────────────
+  await validateFragments(decisions, lines);
+
+  // ── Debug log ──────────────────────────────────────────────────────────────
+  const fragments = decisions.filter((d) => d.fragmentWarning).map((d) => d.index);
+
   const decisionLog = decisions
     .map((d) => {
       const src = indexedLines.find((l) => l.index === d.index);
@@ -94,7 +206,8 @@ export async function processSegmentGroup(
         d.action === "trim"
           ? `"${d.text}"`
           : `"${src?.text?.slice(0, 80)}${(src?.text?.length ?? 0) > 80 ? "…" : ""}"`;
-      return `[${d.index}] ${d.action.toUpperCase().padEnd(6)} | ${label} | ${preview}`;
+      const warn = d.fragmentWarning ? " ⚠ FRAGMENT" : "";
+      return `[${d.index}] ${d.action.toUpperCase().padEnd(6)} | ${label} | ${preview}${warn}`;
     })
     .join("\n");
 
@@ -107,6 +220,12 @@ export async function processSegmentGroup(
     "",
     "════════════════ PARSED DECISIONS ════════════════",
     decisionLog,
+    ...(missingIndices.length > 0
+      ? ["", `⚠ Missing indices (defaulted to KEEP): [${missingIndices.join(", ")}]`]
+      : []),
+    ...(fragments.length > 0
+      ? ["", `⚠ Fragment warnings: [${fragments.join(", ")}]`]
+      : []),
     "════════════════════════════════════════════════",
   ].join("\n");
 

@@ -17,6 +17,15 @@ interface Props {
 
 const DEFAULT_MODEL = "claude-sonnet-4-20250514";
 
+/** Max segments processed at the same time. */
+const MAX_CONCURRENT_SEGMENTS = 3;
+
+/** Max 429-retry attempts per segment (after the first try). */
+const MAX_RETRIES = 2;
+
+/** Base delay for exponential backoff in ms (doubles each retry). */
+const RETRY_BASE_MS = 1000;
+
 type PromptMode = "default" | "custom";
 
 interface SegGroupStatus {
@@ -26,9 +35,82 @@ interface SegGroupStatus {
   kept?: number;
   removed?: number;
   trimmed?: number;
+  errorMessage?: string;
 }
 
-export default function PromptStep({ transcript, segments, speakerMap, onComplete }: Props) {
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Simple counting semaphore. Limits how many async tasks run simultaneously.
+ */
+function createSemaphore(limit: number) {
+  let active = 0;
+  const queue: (() => void)[] = [];
+
+  return {
+    acquire(): Promise<void> {
+      if (active < limit) {
+        active++;
+        return Promise.resolve();
+      }
+      return new Promise<void>((resolve) => queue.push(resolve));
+    },
+    release() {
+      active--;
+      const next = queue.shift();
+      if (next) {
+        active++;
+        next();
+      }
+    },
+  };
+}
+
+/**
+ * Calls fn(), retrying up to maxRetries times on HTTP 429 errors with
+ * exponential backoff. Any other error is re-thrown immediately.
+ */
+async function withRetry<T>(
+  fn: () => Promise<T>,
+  maxRetries = MAX_RETRIES
+): Promise<T> {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      const status =
+        (err as { status?: number })?.status ??
+        (err as { statusCode?: number })?.statusCode;
+      const isRateLimit = status === 429;
+
+      if (isRateLimit && attempt < maxRetries) {
+        const delayMs = RETRY_BASE_MS * Math.pow(2, attempt);
+        console.warn(
+          `Rate-limited (429) on attempt ${attempt + 1}. Retrying in ${delayMs}ms…`
+        );
+        await new Promise((res) => setTimeout(res, delayMs));
+        continue;
+      }
+
+      throw err;
+    }
+  }
+  // Unreachable, but satisfies TypeScript
+  throw new Error("withRetry: exhausted retries");
+}
+
+// ---------------------------------------------------------------------------
+// Component
+// ---------------------------------------------------------------------------
+
+export default function PromptStep({
+  transcript,
+  segments,
+  speakerMap,
+  onComplete,
+}: Props) {
   const [mode, setMode] = useState<PromptMode>("default");
   const [customPrompt, setCustomPrompt] = useState("");
   const [loading, setLoading] = useState(false);
@@ -41,105 +123,172 @@ export default function PromptStep({ transcript, segments, speakerMap, onComplet
     if (!activePrompt.trim()) return;
     setLoading(true);
 
-    const allDecisions: LineDecision[] = [];
+    // Results array sized to segment count; filled in as tasks complete.
+    // We allocate it up front so we can write by index and then flatten in order.
+    const resultsByIndex: LineDecision[][] = new Array(
+      hasSegments ? segments.length : 1
+    );
 
     if (hasSegments) {
-      const statuses: SegGroupStatus[] = segments.map((g) => ({
+      // ── Parallel path ──────────────────────────────────────────────────────
+
+      const initialStatuses: SegGroupStatus[] = segments.map((g) => ({
         title: g.title || `Segment ${g.id || ""}`,
         lineCount: (g.endLine ?? 0) - (g.startLine ?? 0) + 1,
         state: "pending" as const,
       }));
-      setGroupStatuses([...statuses]);
+      setGroupStatuses(initialStatuses);
 
-      for (let i = 0; i < segments.length; i++) {
-        const group = segments[i];
+      const semaphore = createSemaphore(MAX_CONCURRENT_SEGMENTS);
+
+      /**
+       * One task per segment. Acquires the semaphore, processes, releases.
+       * Status updates use the functional form of setState so concurrent
+       * tasks never clobber each other.
+       */
+      const tasks = segments.map((group, i) => async () => {
         const startLine = group.startLine ?? 0;
         const endLine = group.endLine ?? transcript.length - 1;
         const lines = transcript.slice(startLine, endLine + 1);
 
-        statuses[i] = { ...statuses[i], state: "processing" };
-        setGroupStatuses([...statuses]);
+        await semaphore.acquire();
+
+        // Mark as processing
+        setGroupStatuses((prev) => {
+          const next = [...prev];
+          next[i] = { ...next[i], state: "processing" };
+          return next;
+        });
 
         try {
-          const decisions = await processSegmentGroup(
-            lines,
-            startLine,
-            activePrompt,
-            DEFAULT_MODEL,
-            group.title,
-            group.summary,
-            speakerMap
+          const decisions = await withRetry(() =>
+            processSegmentGroup(
+              lines,
+              startLine,
+              activePrompt,
+              DEFAULT_MODEL,
+              group.title,
+              group.summary,
+              speakerMap
+            )
           );
-          const kept = decisions.filter((d) => d.action === "keep").length;
-          const removed = decisions.filter((d) => d.action === "remove").length;
-          const trimmed = decisions.filter((d) => d.action === "trim").length;
 
-          statuses[i] = { ...statuses[i], state: "done", kept, removed, trimmed };
-          setGroupStatuses([...statuses]);
-          allDecisions.push(...decisions);
+          resultsByIndex[i] = decisions;
+
+          setGroupStatuses((prev) => {
+            const next = [...prev];
+            next[i] = {
+              ...next[i],
+              state: "done",
+              kept: decisions.filter((d) => d.action === "keep").length,
+              removed: decisions.filter((d) => d.action === "remove").length,
+              trimmed: decisions.filter((d) => d.action === "trim").length,
+            };
+            return next;
+          });
         } catch (err) {
-          console.error(`Segment ${i} error:`, err);
-          statuses[i] = { ...statuses[i], state: "error" };
-          setGroupStatuses([...statuses]);
-          for (let j = startLine; j <= endLine; j++) {
-            allDecisions.push({ index: j, action: "keep" });
-          }
+          console.error(`Segment ${i} ("${group.title}") failed:`, err);
+
+          const message =
+            err instanceof Error ? err.message : "Unknown error";
+
+          // Fallback: keep all lines in the segment so nothing is lost
+          resultsByIndex[i] = Array.from(
+            { length: endLine - startLine + 1 },
+            (_, j) => ({ index: startLine + j, action: "keep" as const })
+          );
+
+          setGroupStatuses((prev) => {
+            const next = [...prev];
+            next[i] = { ...next[i], state: "error", errorMessage: message };
+            return next;
+          });
+        } finally {
+          semaphore.release();
         }
-      }
+      });
+
+      // Fire all tasks and wait for every one to settle (failures don't abort others)
+      await Promise.allSettled(tasks.map((t) => t()));
     } else {
-      const statuses: SegGroupStatus[] = [
+      // ── Single-transcript path (no segmentation) ───────────────────────────
+
+      const initialStatuses: SegGroupStatus[] = [
         {
           title: "Full Transcript",
           lineCount: transcript.length,
           state: "processing",
         },
       ];
-      setGroupStatuses([...statuses]);
+      setGroupStatuses(initialStatuses);
 
       try {
-        const decisions = await processSegmentGroup(
-          transcript,
-          0,
-          activePrompt,
-          DEFAULT_MODEL,
-          undefined,
-          undefined,
-          speakerMap
+        const decisions = await withRetry(() =>
+          processSegmentGroup(
+            transcript,
+            0,
+            activePrompt,
+            DEFAULT_MODEL,
+            undefined,
+            undefined,
+            speakerMap
+          )
         );
-        statuses[0] = {
-          ...statuses[0],
-          state: "done",
-          kept: decisions.filter((d) => d.action === "keep").length,
-          removed: decisions.filter((d) => d.action === "remove").length,
-          trimmed: decisions.filter((d) => d.action === "trim").length,
-        };
-        setGroupStatuses([...statuses]);
-        allDecisions.push(...decisions);
+
+        resultsByIndex[0] = decisions;
+
+        setGroupStatuses([
+          {
+            title: "Full Transcript",
+            lineCount: transcript.length,
+            state: "done",
+            kept: decisions.filter((d) => d.action === "keep").length,
+            removed: decisions.filter((d) => d.action === "remove").length,
+            trimmed: decisions.filter((d) => d.action === "trim").length,
+          },
+        ]);
       } catch (err) {
-        console.error("Processing error:", err);
-        statuses[0] = { ...statuses[0], state: "error" };
-        setGroupStatuses([...statuses]);
-        for (let j = 0; j < transcript.length; j++) {
-          allDecisions.push({ index: j, action: "keep" });
-        }
+        console.error("Full transcript processing failed:", err);
+
+        const message = err instanceof Error ? err.message : "Unknown error";
+
+        resultsByIndex[0] = transcript.map((_, j) => ({
+          index: j,
+          action: "keep" as const,
+        }));
+
+        setGroupStatuses([
+          {
+            title: "Full Transcript",
+            lineCount: transcript.length,
+            state: "error",
+            errorMessage: message,
+          },
+        ]);
       }
     }
 
+    // Flatten results in segment order and hand off
+    const allDecisions = resultsByIndex.flat();
     setLoading(false);
     onComplete(allDecisions);
-  }, [activePrompt, transcript, segments, hasSegments, onComplete]);
+  }, [activePrompt, transcript, segments, hasSegments, speakerMap, onComplete]);
 
   const doneCount = groupStatuses.filter(
     (s) => s.state === "done" || s.state === "error"
   ).length;
+  const processingCount = groupStatuses.filter(
+    (s) => s.state === "processing"
+  ).length;
   const totalGroups = groupStatuses.length;
+  const errorCount = groupStatuses.filter((s) => s.state === "error").length;
 
   return (
     <div>
       <h2 className="text-2xl font-bold mb-1">LLM Edit Prompt</h2>
       <p className="text-neutral-400 mb-6 text-sm">
         {hasSegments
-          ? `${segments.length} segments will each be processed as a separate LLM call.`
+          ? `${segments.length} segments will be processed in parallel (up to ${MAX_CONCURRENT_SEGMENTS} at a time).`
           : "The full transcript will be processed in one LLM call."}
       </p>
 
@@ -200,7 +349,7 @@ export default function PromptStep({ transcript, segments, speakerMap, onComplet
           className="px-6"
         >
           {loading
-            ? `Processing segment ${doneCount + 1}/${totalGroups}...`
+            ? `Processing… (${doneCount}/${totalGroups} done${processingCount > 0 ? `, ${processingCount} in flight` : ""})`
             : "Apply Prompt"}
         </Button>
       </Card>
@@ -210,6 +359,11 @@ export default function PromptStep({ transcript, segments, speakerMap, onComplet
         <Card className="p-4 border-neutral-800 bg-neutral-900/30 mb-6">
           <h3 className="text-sm font-medium text-neutral-300 mb-3">
             Processing Progress
+            {errorCount > 0 && (
+              <span className="ml-2 text-xs text-red-400">
+                ({errorCount} failed — content preserved as KEEP)
+              </span>
+            )}
           </h3>
           <div className="space-y-3">
             {groupStatuses.map((g, i) => (
@@ -239,6 +393,11 @@ export default function PromptStep({ transcript, segments, speakerMap, onComplet
                       <span className="text-green-500">{g.kept} kept</span>
                       <span className="text-yellow-500">{g.trimmed} trimmed</span>
                       <span className="text-red-500">{g.removed} removed</span>
+                    </div>
+                  )}
+                  {g.state === "error" && g.errorMessage && (
+                    <div className="mt-0.5 text-xs text-red-400 truncate">
+                      {g.errorMessage}
                     </div>
                   )}
                 </div>

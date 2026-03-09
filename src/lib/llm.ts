@@ -31,6 +31,12 @@ export function buildCreativeMessage(
   return `${context}## Transcript\n${lineList}`;
 }
 
+export interface ParseIndexedDecisionsResult {
+  decisions: LineDecision[];
+  /** Indices that were absent from the LLM response and defaulted to KEEP. */
+  missingIndices: number[];
+}
+
 /**
  * Parse the LLM's index-based decision output into LineDecision[].
  *
@@ -39,14 +45,15 @@ export function buildCreativeMessage(
  *   [1] KEEP
  *   [2] TRIM: Some trimmed text here
  *
- * Lines not listed are assumed REMOVE.
+ * Lines not listed default to KEEP (safe fallback — never silently cut content).
+ * Missing indices are recorded in missingIndices so callers can warn/flag them.
  * Robust: ignores blank lines, commentary, and markdown fences.
  */
 export function parseIndexedDecisions(
   response: string,
   totalLines: number,
   startIndex: number
-): LineDecision[] {
+): ParseIndexedDecisionsResult {
   const decisionMap = new Map<number, LineDecision>();
 
   // Strip markdown code fences if present
@@ -70,19 +77,32 @@ export function parseIndexedDecisions(
     const text = match[3]?.trim() || undefined;
 
     if (action === "trim" && !text) {
-      // TRIM without text → treat as KEEP (safe fallback)
+      // TRIM without text => treat as KEEP (safe fallback)
       decisionMap.set(index, { index, action: "keep" });
     } else {
       decisionMap.set(index, { index, action, ...(text ? { text } : {}) });
     }
   }
 
-  // Fill in missing indices as REMOVE
+  // Fill in missing indices as KEEP (safe default -- never silently cut content)
   const decisions: LineDecision[] = [];
+  const missingIndices: number[] = [];
+
   for (let i = 0; i < totalLines; i++) {
     const idx = startIndex + i;
-    decisions.push(decisionMap.get(idx) ?? { index: idx, action: "remove" });
+    if (decisionMap.has(idx)) {
+      decisions.push(decisionMap.get(idx)!);
+    } else {
+      missingIndices.push(idx);
+      decisions.push({ index: idx, action: "keep" });
+    }
   }
 
-  return decisions;
+  if (missingIndices.length > 0) {
+    console.warn(
+      `Warning: ${missingIndices.length} ${missingIndices.length === 1 ? "index" : "indices"} had no LLM decision, defaulting to KEEP: [${missingIndices.join(", ")}]`
+    );
+  }
+
+  return { decisions, missingIndices };
 }

@@ -32,6 +32,9 @@ Remove everything after the payoff lands. The clip must build toward one dominan
 Starting from the payoff, determine the minimum context a first-time viewer needs for it to make sense. Keep only that. Remove all material that does not directly support the single tension → payoff arc.
 
 ## EDITING RULES
+- **FILLER RULE:** Never KEEP a line whose entire content is filler or discourse markers (Okay, Yeah, Mhmm, Right, So, Now, Perfect, Alright, Great, Sure, Yep, Cool, Absolutely, Wow, Uh, Um, Oh). These must always be REMOVE. If a filler word opens a substantive sentence, TRIM to start from the substantive part instead.
+- **MINIMUM LENGTH RULE:** Never KEEP or TRIM a line to fewer than 8 words unless it is a complete standalone sentence ending with terminal punctuation (. ? !). A 3-word clip with no period is almost always wrong — either extend the keep window or REMOVE it.
+- **BOUNDARY RULE:** Before finalizing your output, review every KEEP line that follows a REMOVE line. If it starts mid-sentence (lowercase opener, conjunction, preposition, or dependent clause), either KEEP the previous line too or TRIM it to include the sentence opener. Similarly, if a KEEP line ends mid-sentence and the next line is REMOVE, either KEEP the next line or TRIM the current line to end at a sentence boundary. Never output a clip that starts or ends mid-thought.
 - Remove filler words, false starts, and stutters.
 - Tighten sentences — keep them punchy while preserving the speaker's voice.
 - You may merge adjacent utterances from the same speaker into one TRIM decision by combining their text (trimmed). Use the FIRST utterance's index and REMOVE the subsequent ones.
@@ -43,6 +46,10 @@ Starting from the payoff, determine the minimum context a first-time viewer need
 Read only the KEEP and TRIM lines in order as a first-time viewer would hear them. Every sentence must flow naturally into the next. If a removal creates a jarring jump, further trim surrounding material until the remaining transcript flows naturally.
 - **Clean opening:** The first KEEP or TRIM utterance must be a complete, coherent sentence. No greetings, pre-conversation noise, or mid-thought starts.
 - **No mid-sentence starts:** If removing an utterance causes the next kept utterance to begin mid-sentence, extend the REMOVE or TRIM that utterance's opening to fix it.
+- **TRIM must start at a sentence boundary:** When using TRIM, the kept text MUST begin at a natural sentence or clause boundary. Never start TRIM text from the middle of a sentence.
+  - BAD:  [42] TRIM: of our annual revenue in 65% of our markets
+  - GOOD: [42] TRIM: We generate 40% of our annual revenue in 65% of our markets
+- **KEEP after REMOVE — check the join:** When you KEEP a line that immediately follows a REMOVEd line, read the kept line's first word aloud. If it starts with a lowercase word, a preposition, a conjunction, or any fragment that cannot stand alone, you must either (a) KEEP the preceding line too, or (b) TRIM it so the sentence opener is included.
 
 ## OUTPUT FORMAT
 For each utterance in the input transcript, output exactly one decision line:

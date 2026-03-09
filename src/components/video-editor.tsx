@@ -2,7 +2,7 @@
 
 import { useMemo, useState, useRef, useEffect, useCallback } from "react";
 import { EditableWord, SegmentGroup } from "@/lib/types";
-import { computeFinalClips } from "@/lib/export";
+import { computeFinalClips, generateDebugTXT } from "@/lib/export";
 import { Button } from "@/components/ui/button";
 
 interface Props {
@@ -11,6 +11,18 @@ interface Props {
   onChange: (words: EditableWord[]) => void;
   onContinue: () => void;
   videoSrc?: string;
+  fileName?: string;
+  duration?: number;
+}
+
+function downloadText(content: string, filename: string) {
+  const blob = new Blob([content], { type: "text/plain" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
 }
 
 interface WordGroup {
@@ -45,7 +57,7 @@ const SEGMENT_BG_COLORS = [
   "bg-pink-500/10","bg-cyan-500/10","bg-yellow-500/10","bg-red-500/10",
 ];
 
-export default function VideoEditor({ words, segments = [], onChange, onContinue, videoSrc }: Props) {
+export default function VideoEditor({ words, segments = [], onChange, onContinue, videoSrc, fileName = "clip", duration = 0 }: Props) {
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [activePage, setActivePage] = useState(0);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -384,9 +396,22 @@ export default function VideoEditor({ words, segments = [], onChange, onContinue
             </>
           )}
         </div>
-        <Button onClick={onContinue} className="bg-violet-600 text-white hover:bg-violet-500 font-semibold shrink-0">
-          Export →
-        </Button>
+        <div className="flex items-center gap-2 shrink-0">
+          <Button
+            variant="outline"
+            onClick={() => {
+              const report = generateDebugTXT(words, fileName, duration);
+              downloadText(report, `${fileName.replace(/\.[^.]+$/, "")}-debug.txt`);
+            }}
+            className="border-neutral-700 text-neutral-400 hover:text-white text-xs px-3"
+            title="Download word-level debug transcript"
+          >
+            ↓ Debug TXT
+          </Button>
+          <Button onClick={onContinue} className="bg-violet-600 text-white hover:bg-violet-500 font-semibold">
+            Export →
+          </Button>
+        </div>
       </div>
 
       {/* Main content */}
@@ -500,6 +525,30 @@ export default function VideoEditor({ words, segments = [], onChange, onContinue
                           Speaker {group.speaker}
                         </button>
                       )}
+                      {group.words[0]?.fragmentWarning && (
+                        <span
+                          className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-yellow-500/15 border border-yellow-500/40 text-yellow-400"
+                          title="This line may start mid-sentence — review before exporting"
+                        >
+                          ⚠ fragment?
+                        </span>
+                      )}
+                      {group.words[0]?.boundaryWarning && (
+                        <span
+                          className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-orange-500/15 border border-orange-500/40 text-orange-400"
+                          title="Large removed gap before this line — may be a split sentence, review manually"
+                        >
+                          ⚡ boundary?
+                        </span>
+                      )}
+                      {group.words.some((w) => w.coherenceWarning) && (
+                        <span
+                          className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-amber-500/15 border border-amber-500/40 text-amber-400"
+                          title="Coherence check flagged this clip — a viewer may find it confusing"
+                        >
+                          👁 review
+                        </span>
+                      )}
                     </div>
 
                     {/* Words */}
@@ -517,7 +566,9 @@ export default function VideoEditor({ words, segments = [], onChange, onContinue
                                 ? "text-neutral-700 line-through decoration-neutral-700/50"
                                 : isSelected
                                   ? "bg-violet-500/30 text-white"
-                                  : "text-neutral-200 hover:bg-neutral-700/30"
+                                  : word.coherenceWarning
+                                    ? "text-amber-200 bg-amber-500/10 hover:bg-amber-500/20"
+                                    : "text-neutral-200 hover:bg-neutral-700/30"
                               }
                               ${isSelected && word.removed ? "bg-red-500/20 text-neutral-500" : ""}
                             `}

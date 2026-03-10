@@ -48,6 +48,145 @@ def get_audio_metadata(audio_path: str) -> tuple[float, float]:
     return (start_time, duration)
 
 
+def get_channel_count(path: str) -> int:
+    """Return the number of audio channels in the first audio stream."""
+    try:
+        output = run_command([
+            "ffprobe", "-v", "error",
+            "-select_streams", "a:0",
+            "-show_entries", "stream=channels",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            path,
+        ])
+        return int(output.strip().split("\n")[0])
+    except Exception:
+        return 1
+
+
+def extract_channel(video_path: str, channel: int) -> str:
+    """Extract one stereo channel (0=left/host, 1=right/caller) as a mono MP3.
+
+    Returns the path to a temporary file that the caller must delete.
+    """
+    channel_label = "FL" if channel == 0 else "FR"
+    tmp = tempfile.mktemp(suffix=".mp3", prefix=f"clipper-ch{channel}-")
+    result = subprocess.run(
+        [
+            "ffmpeg", "-i", video_path, "-vn",
+            "-af", f"pan=mono|c0={channel_label}",
+            "-ar", "16000", "-b:a", "128k",
+            "-avoid_negative_ts", "make_zero",
+            tmp, "-y",
+        ],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg channel {channel} extraction failed: {result.stderr.strip()}")
+    return tmp
+
+
+async def transcribe_channel(
+    client: AsyncDeepgramClient,
+    audio_path: str,
+    speaker_id: int,
+    audio_offset: float = 0.0,
+) -> tuple[List[dict], Optional[str]]:
+    """Transcribe a mono channel file.
+
+    Returns (entries, detected_language).  All word-level speaker fields are
+    set to speaker_id — diarization is disabled since we already know the speaker.
+    """
+    chunk_paths, chunk_dir = split_audio_if_needed(audio_path)
+    total_chunks = len(chunk_paths)
+    offsets = get_chunk_offsets(audio_path, total_chunks) if total_chunks > 1 else [0.0]
+
+    entries: List[dict] = []
+    detected_language: Optional[str] = None
+
+    try:
+        for idx, chunk_path in enumerate(chunk_paths, start=1):
+            with open(chunk_path, "rb") as f:
+                audio_bytes = f.read()
+
+            response = await client.listen.v1.media.transcribe_file(
+                request=audio_bytes,
+                model="nova-3",
+                smart_format=True,
+                punctuate=True,
+                utterances=True,
+                diarize=False,
+                paragraphs=True,
+            )
+
+            chunk_data = response.model_dump()
+            chunk_entries = build_transcript_entries(chunk_data, offsets[idx - 1] + audio_offset)
+
+            # Stamp every word with the known speaker_id (channel-based, not diarized)
+            for entry in chunk_entries:
+                for word in entry.get("words", []):
+                    word["speaker"] = speaker_id
+
+            entries.extend(chunk_entries)
+
+            if not detected_language:
+                channels = chunk_data.get("results", {}).get("channels", [])
+                if channels:
+                    detected_language = channels[0].get("detected_language")
+    finally:
+        if chunk_dir and os.path.exists(chunk_dir):
+            shutil.rmtree(chunk_dir)
+
+    return entries, detected_language
+
+
+async def run_stereo_transcription(video_path: str, audio_offset: float = 0.0) -> None:
+    """Transcribe a stereo video by sending each channel to Deepgram separately.
+
+    Left channel → speaker 0 (host), right channel → speaker 1 (caller).
+    Entries from both channels are merged and sorted by start time.
+    """
+    _, duration = get_audio_metadata(video_path)
+
+    print(json.dumps({"status": "extracting_channels"}), flush=True)
+    left_path = extract_channel(video_path, 0)
+    right_path = extract_channel(video_path, 1)
+    size_mb = round((os.path.getsize(left_path) + os.path.getsize(right_path)) / (1024 * 1024), 1)
+    print(json.dumps({"status": "audio_extracted", "size_mb": size_mb, "audio_offset": audio_offset}), flush=True)
+
+    client = AsyncDeepgramClient(api_key=os.environ["DEEPGRAM_API_KEY"])
+    detected_language: Optional[str] = None
+
+    try:
+        print(json.dumps({"status": "transcribing_chunk", "chunk": 1, "total": 2}), flush=True)
+        left_entries, lang = await transcribe_channel(client, left_path, speaker_id=0, audio_offset=audio_offset)
+        if lang:
+            detected_language = lang
+
+        print(json.dumps({"status": "transcribing_chunk", "chunk": 2, "total": 2}), flush=True)
+        right_entries, lang = await transcribe_channel(client, right_path, speaker_id=1, audio_offset=audio_offset)
+        if lang and not detected_language:
+            detected_language = lang
+    finally:
+        for p in (left_path, right_path):
+            if os.path.exists(p):
+                os.unlink(p)
+
+    transcript = sorted(left_entries + right_entries, key=lambda e: e["start"])
+    duration_out = duration if duration > 0 else (transcript[-1]["end"] if transcript else 0)
+
+    print(
+        json.dumps({
+            "status": "done",
+            "transcript": transcript,
+            "duration": duration_out,
+            "fps": 0,
+            "language": detected_language or "en",
+            "model": "deepgram:nova-3",
+        }),
+        flush=True,
+    )
+
+
 def split_audio_if_needed(audio_path: str) -> tuple[List[str], Optional[str]]:
     size = os.path.getsize(audio_path)
     if size <= MAX_DEEPGRAM_FILE_SIZE:
@@ -221,32 +360,42 @@ async def main() -> None:
         print(json.dumps({"error": "Unsupported file type. Please provide a video (mp4, mov) or audio file (mp3, wav, m4a, etc.)"}), flush=True)
         sys.exit(1)
 
-    extracted_audio_path: Optional[str] = None
-    audio_offset = 0.0
-    if is_video:
-        print(json.dumps({"status": "extracting_audio"}), flush=True)
-        # Capture audio stream start_time before extraction so we can shift Deepgram timestamps
-        audio_start, _ = get_audio_metadata(audio_path)
-        audio_offset = audio_start
-        tmp = tempfile.mktemp(suffix=".mp3", prefix="clipper-audio-")
-        result = subprocess.run(
-            ["ffmpeg", "-i", audio_path, "-vn", "-ar", "16000", "-ac", "1", "-b:a", "128k",
-             "-avoid_negative_ts", "make_zero", tmp, "-y"],
-            capture_output=True, text=True,
-        )
-        if result.returncode != 0:
-            print(json.dumps({"error": f"ffmpeg audio extraction failed: {result.stderr.strip()}"}), flush=True)
-            sys.exit(1)
-        size_mb = round(os.path.getsize(tmp) / (1024 * 1024), 1)
-        print(json.dumps({"status": "audio_extracted", "size_mb": size_mb, "audio_offset": audio_offset}), flush=True)
-        extracted_audio_path = tmp
-        audio_path = tmp
-
     if not os.environ.get("DEEPGRAM_API_KEY"):
         print(json.dumps({"error": "DEEPGRAM_API_KEY not set"}), flush=True)
         sys.exit(1)
 
+    extracted_audio_path: Optional[str] = None
+    audio_offset = 0.0
+
     try:
+        if is_video:
+            # Capture audio stream start_time so we can shift Deepgram timestamps
+            audio_start, _ = get_audio_metadata(audio_path)
+            audio_offset = audio_start
+
+            channels = get_channel_count(audio_path)
+            print(json.dumps({"status": "channel_detected", "channels": channels}), flush=True)
+            if channels >= 2:
+                # Stereo video: left channel = host (speaker 0), right = caller (speaker 1)
+                await run_stereo_transcription(audio_path, audio_offset=audio_offset)
+                return
+
+            # Mono video: fall through to standard extraction + diarization
+            print(json.dumps({"status": "extracting_audio"}), flush=True)
+            tmp = tempfile.mktemp(suffix=".mp3", prefix="clipper-audio-")
+            result = subprocess.run(
+                ["ffmpeg", "-i", audio_path, "-vn", "-ar", "16000", "-ac", "1", "-b:a", "128k",
+                 "-avoid_negative_ts", "make_zero", tmp, "-y"],
+                capture_output=True, text=True,
+            )
+            if result.returncode != 0:
+                print(json.dumps({"error": f"ffmpeg audio extraction failed: {result.stderr.strip()}"}), flush=True)
+                sys.exit(1)
+            size_mb = round(os.path.getsize(tmp) / (1024 * 1024), 1)
+            print(json.dumps({"status": "audio_extracted", "size_mb": size_mb, "audio_offset": audio_offset}), flush=True)
+            extracted_audio_path = tmp
+            audio_path = tmp
+
         await run_transcription(audio_path, audio_offset=audio_offset)
     except Exception as exc:
         print(json.dumps({"error": str(exc)}), flush=True)

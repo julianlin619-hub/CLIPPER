@@ -187,7 +187,6 @@ function buildSpeakerTurns(
     originalTexts: string[];
     keptWords: string[];
     totalWords: number;
-    keptWords_count: number;
   };
 
   const merged: Acc[] = [];
@@ -200,23 +199,21 @@ function buildSpeakerTurns(
       last.originalTexts.push(transcript[i].text);
       last.keptWords.push(...keptWds);
       last.totalWords += total;
-      last.keptWords_count += keptWds.length;
     } else {
       merged.push({
         speaker: spk,
         originalTexts: [transcript[i].text],
         keptWords: [...keptWds],
         totalWords: total,
-        keptWords_count: keptWds.length,
       });
     }
   }
 
   return merged.map((turn, idx) => {
     const action: "keep" | "remove" | "trim" =
-      turn.keptWords_count === 0
+      turn.keptWords.length === 0
         ? "remove"
-        : turn.keptWords_count === turn.totalWords
+        : turn.keptWords.length === turn.totalWords
         ? "keep"
         : "trim";
     return {
@@ -302,19 +299,7 @@ export function generateXmlAlignmentDebug(
   duration: number,
   fps: number = 30
 ): string {
-  const ntsc2997 = Math.abs(fps - 29.97) < 0.02;
-  const ntsc5994 = Math.abs(fps - 59.94) < 0.02;
-  let frameNum: number, frameDenom: number, frameDuration: string;
-  if (ntsc2997) {
-    frameNum = 1001; frameDenom = 30000; frameDuration = "1001/30000s";
-  } else if (ntsc5994) {
-    frameNum = 1001; frameDenom = 60000; frameDuration = "1001/60000s";
-  } else {
-    const effectiveFps = Math.round(fps);
-    frameDenom = effectiveFps * 100;
-    frameNum = 100;
-    frameDuration = `100/${frameDenom}s`;
-  }
+  const { frameDuration, frameNum, frameDenom } = getFrameTimeFormat(fps);
 
   const clips = computeFinalClips(words);
   const assetDurFrames = Math.ceil(duration * fps);

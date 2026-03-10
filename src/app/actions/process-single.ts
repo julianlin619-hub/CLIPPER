@@ -4,8 +4,6 @@ import Anthropic from "@anthropic-ai/sdk";
 import OpenAI from "openai";
 import { TranscriptEntry, LineDecision, SpeakerMap } from "@/lib/types";
 import { buildCreativeMessage, parseIndexedDecisions } from "@/lib/llm";
-import { writeFileSync } from "fs";
-import { join } from "path";
 
 const TEMPERATURE = 0.3;
 
@@ -231,10 +229,6 @@ ${comprehensionSummary}
 ${creativeMessage}`
     : creativeMessage;
 
-  console.log('[DEBUG-PIPELINE] ── processSegmentGroup ──────────────────────────');
-  console.log('[DEBUG-PIPELINE] SYSTEM PROMPT:\n' + editPrompt);
-  console.log('[DEBUG-PIPELINE] USER MESSAGE:\n' + editMessage);
-
   const rawOutput = await callLLM(
     model,
     editPrompt,
@@ -242,71 +236,14 @@ ${creativeMessage}`
     TEMPERATURE
   );
 
-  console.log('[DEBUG-PIPELINE] RAW LLM RESPONSE:\n' + rawOutput);
-
   if (!rawOutput.trim()) {
     throw new Error("LLM returned empty response");
   }
 
-  const { decisions, missingIndices } = parseIndexedDecisions(rawOutput, lines.length, startLineIndex);
-
-  console.log('[DEBUG-PIPELINE] PARSED DECISIONS (' + decisions.length + ' total):');
-  decisions.forEach((d) => {
-    if (d.action === 'trim') {
-      console.log(`[DEBUG-PIPELINE]   [${d.index}] TRIM: ${d.text}`);
-    } else {
-      console.log(`[DEBUG-PIPELINE]   [${d.index}] ${d.action.toUpperCase()}`);
-    }
-  });
-  if (missingIndices && missingIndices.length > 0) {
-    console.log('[DEBUG-PIPELINE] MISSING INDICES (defaulted to KEEP): ' + missingIndices.join(', '));
-  }
+  const { decisions } = parseIndexedDecisions(rawOutput, lines.length, startLineIndex);
 
   // ── Fragment validation (non-blocking) ───────────────────────────────────
   await validateFragments(decisions, lines);
-
-  // ── Debug log ──────────────────────────────────────────────────────────────
-  const fragments = decisions.filter((d) => d.fragmentWarning).map((d) => d.index);
-
-  const decisionLog = decisions
-    .map((d) => {
-      const src = indexedLines.find((l) => l.index === d.index);
-      const label = src?.speaker != null ? `Speaker ${src.speaker}` : "?";
-      const preview =
-        d.action === "trim"
-          ? `"${d.text}"`
-          : `"${src?.text?.slice(0, 80)}${(src?.text?.length ?? 0) > 80 ? "…" : ""}"`;
-      const warn = d.fragmentWarning ? " ⚠ FRAGMENT" : "";
-      return `[${d.index}] ${d.action.toUpperCase().padEnd(6)} | ${label} | ${preview}${warn}`;
-    })
-    .join("\n");
-
-  const logContent = [
-    "════════════════ COMPREHENSION SUMMARY ════════════════",
-    comprehensionSummary ?? "(skipped)",
-    "",
-    "════════════════ INPUT ════════════════",
-    editMessage,
-    "",
-    "════════════════ RAW LLM OUTPUT ════════════════",
-    rawOutput,
-    "",
-    "════════════════ PARSED DECISIONS ════════════════",
-    decisionLog,
-    ...(missingIndices.length > 0
-      ? ["", `⚠ Missing indices (defaulted to KEEP): [${missingIndices.join(", ")}]`]
-      : []),
-    ...(fragments.length > 0
-      ? ["", `⚠ Fragment warnings: [${fragments.join(", ")}]`]
-      : []),
-    "════════════════════════════════════════════════",
-  ].join("\n");
-
-  try {
-    writeFileSync(join(process.cwd(), "debug-last-run.txt"), logContent, "utf8");
-  } catch {
-    // non-fatal
-  }
 
   return decisions;
 }

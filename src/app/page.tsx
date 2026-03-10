@@ -158,15 +158,6 @@ function buildEditableWords(
     const matchPct = trimTokens.length > 0 ? kept.size / trimTokens.length : 0;
     const matchPassed = matchPct >= MATCH_THRESHOLD;
 
-    // DEBUG: single-utterance attempt
-    const srcText = sourceWords.map((w) => w.word).join(' ');
-    const keptWords = sourceWords.filter((_, wi) => kept.has(wi)).map((w) => w.word);
-    console.log(`[DEBUG-PIPELINE] TRIM utterance ${i}:`);
-    console.log(`[DEBUG-PIPELINE]   original  : ${srcText}`);
-    console.log(`[DEBUG-PIPELINE]   trim text : ${decision.text}`);
-    console.log(`[DEBUG-PIPELINE]   matched   : ${keptWords.join(' ')}`);
-    console.log(`[DEBUG-PIPELINE]   match%    : ${(matchPct * 100).toFixed(1)}% (${kept.size}/${trimTokens.length} tokens) — ${matchPassed ? 'PASSED' : 'trying expanded match...'}`);
-
     if (matchPassed) {
       const removed = new Set<number>();
       sourceWords.forEach((_, wi) => { if (!kept.has(wi)) removed.add(wi); });
@@ -193,8 +184,6 @@ function buildEditableWords(
       const expandedKept = greedyMatch(trimTokens, poolNorm);
       const expandedMatchPct = trimTokens.length > 0 ? expandedKept.size / trimTokens.length : 0;
       const expandedPassed = expandedMatchPct >= MATCH_THRESHOLD;
-
-      console.log(`[DEBUG-PIPELINE] TRIM expanded match for utterance ${i}: included ${expandedCount} additional REMOVE'd utterances, new match: ${(expandedMatchPct * 100).toFixed(1)}% — ${expandedPassed ? 'PASSED' : 'FAILED → keeping all words of utterance ' + i}`);
 
       if (expandedPassed) {
         // Tally which pool positions are removed per utterance
@@ -303,7 +292,7 @@ function stripFillerClips(words: EditableWord[]): EditableWord[] {
     const text = runWords.map((w) => w.text).join(" ");
 
     if (duration < 1.5 && runWords.length <= 3 && isAllFiller(text)) {
-      console.log(`Stripped filler clip: "${text}" (${duration.toFixed(2)}s)`);
+
       for (let k = i; k < j; k++) result[k] = { ...result[k], removed: true };
     }
 
@@ -394,10 +383,7 @@ function repairBoundaryFragments(words: EditableWord[]): EditableWord[] {
     if (gapWords.length <= 10) {
       // Auto-merge: un-remove the gap
       const gapText = gapWords.map((w) => w.text).join(" ");
-      console.log(
-        `Boundary repair: merged gap "${gapText}" (${gapWords.length} words) ` +
-        `between "${clipAText.slice(-30)}" → "${clipBFirstWord}..."`
-      );
+
       for (let k = gapStart; k <= gapEnd; k++) {
         result[k] = { ...result[k], removed: false };
       }
@@ -531,13 +517,14 @@ export default function Home() {
     d: number,
     frameRate: number = 30,
     videoPath: string = "",
-    segs: SegmentGroup[] = []
+    segs: SegmentGroup[] = [],
+    stereo?: boolean
   ) => {
     if (videoPath) setFilePath(videoPath);
     setTranscript(t);
     setDuration(d);
     setFps(frameRate);
-    setSpeakerMap(autoDetectSpeakers(t));
+    setSpeakerMap(stereo ? { 0: "Host", 1: "Caller" } : autoDetectSpeakers(t));
     setSegments(segs);
     setStep("prompt");
   };

@@ -20,7 +20,8 @@ interface Props {
     duration: number,
     fps: number,
     videoPath: string,
-    segments: SegmentGroup[]
+    segments: SegmentGroup[],
+    stereo?: boolean
   ) => void;
   fcpxmlPath: string;
   onFcpxmlSelected: (path: string) => void;
@@ -103,6 +104,11 @@ export default function FileBrowser({ onComplete, fcpxmlPath, onFcpxmlSelected }
   const [txProgress, setTxProgress] = useState(0);
   const [txError, setTxError] = useState<string | null>(null);
 
+  // Stereo channel state
+  const [isStereo, setIsStereo] = useState(false);
+  const [leftChState, setLeftChState] = useState<"idle" | "extracting" | "transcribing" | "done">("idle");
+  const [rightChState, setRightChState] = useState<"idle" | "extracting" | "transcribing" | "done">("idle");
+
   // Results
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
   const [duration, setDuration] = useState(0);
@@ -111,6 +117,7 @@ export default function FileBrowser({ onComplete, fcpxmlPath, onFcpxmlSelected }
   // Segmentation state
   const [segError, setSegError] = useState<string | null>(null);
   const [segments, setSegments] = useState<SegmentGroup[]>([]);
+  const [skipSegmentation, setSkipSegmentation] = useState(false);
 
   // Segment editing
   const [editingSegment, setEditingSegment] = useState<number | null>(null);
@@ -164,6 +171,7 @@ export default function FileBrowser({ onComplete, fcpxmlPath, onFcpxmlSelected }
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
+      let stereo = false;
 
       while (true) {
         const { done, value } = await reader.read();
@@ -179,7 +187,20 @@ export default function FileBrowser({ onComplete, fcpxmlPath, onFcpxmlSelected }
           try {
             const msg = JSON.parse(raw);
             if (msg.error) { setTxStatus("error"); setTxError(msg.error); return; }
-            if (msg.status === "extracting_audio") { setTxStatus("extracting_audio"); setTxStatusText("Extracting audio..."); setTxProgress(20); }
+            if (msg.status === "extracting_channels") {
+              stereo = true;
+              setIsStereo(true);
+              setLeftChState("extracting");
+              setRightChState("extracting");
+              setTxStatusText("Stereo detected — splitting channels...");
+              setTxProgress(20);
+            }
+            else if (msg.status === "audio_extracted" && stereo) {
+              setLeftChState("idle");
+              setRightChState("idle");
+              setTxProgress(35);
+            }
+            else if (msg.status === "extracting_audio") { setTxStatus("extracting_audio"); setTxStatusText("Extracting audio..."); setTxProgress(20); }
             else if (msg.status === "audio_extracted") { setTxStatusText(`Audio extracted (${msg.size_mb} MB)`); setTxProgress(35); }
             else if (msg.status === "chunking_audio") { setTxStatus("chunking_audio"); setTxStatusText("Splitting into chunks..."); setTxProgress(40); }
             else if (msg.status === "chunking_complete") { setTxStatusText(`Split into ${msg.chunks} chunks`); setTxProgress(45); }
@@ -187,9 +208,21 @@ export default function FileBrowser({ onComplete, fcpxmlPath, onFcpxmlSelected }
               setTxStatus("transcribing");
               const pct = msg.total > 1 ? Math.round(45 + (msg.chunk / msg.total) * 45) : 60;
               setTxProgress(pct);
-              setTxStatusText(msg.total > 1 ? `Transcribing chunk ${msg.chunk} / ${msg.total}...` : "Transcribing with Deepgram nova-3...");
+              if (stereo && msg.total === 2) {
+                if (msg.chunk === 1) {
+                  setLeftChState("transcribing");
+                  setTxStatusText("Transcribing host channel (left)...");
+                } else {
+                  setLeftChState("done");
+                  setRightChState("transcribing");
+                  setTxStatusText("Transcribing caller channel (right)...");
+                }
+              } else {
+                setTxStatusText(msg.total > 1 ? `Transcribing chunk ${msg.chunk} / ${msg.total}...` : "Transcribing with Deepgram nova-3...");
+              }
             }
             else if (msg.status === "done" && msg.transcript) {
+              if (stereo) { setLeftChState("done"); setRightChState("done"); }
               setTxStatus("done");
               setTxProgress(100);
               const t: TranscriptEntry[] = msg.transcript;
@@ -199,8 +232,12 @@ export default function FileBrowser({ onComplete, fcpxmlPath, onFcpxmlSelected }
               setDuration(d);
               setFps(f);
               setTxStatusText(`Done — ${t.length} utterances, ${formatTime(d)}`);
-              // Auto-trigger segmentation
-              await runSegmentation(t);
+              // Auto-trigger segmentation (unless user chose to skip)
+              if (skipSegmentation) {
+                setPhase("review");
+              } else {
+                await runSegmentation(t);
+              }
             }
           } catch { /* ignore non-JSON */ }
         }
@@ -302,6 +339,27 @@ export default function FileBrowser({ onComplete, fcpxmlPath, onFcpxmlSelected }
           <div className="mb-8">
             <h2 className="text-2xl font-bold mb-1">Select &amp; Transcribe</h2>
             <p className="text-neutral-400 text-sm">Select both inputs, then transcribe. Caller segments are identified automatically.</p>
+            <div className="mt-3 flex items-center gap-2">
+              <button
+                type="button"
+                role="switch"
+                aria-checked={skipSegmentation}
+                onClick={() => setSkipSegmentation((v) => !v)}
+                className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 focus:outline-none ${
+                  skipSegmentation ? "bg-violet-600" : "bg-neutral-700"
+                }`}
+              >
+                <span
+                  className={`pointer-events-none inline-block h-4 w-4 rounded-full bg-white shadow transition-transform duration-200 ${
+                    skipSegmentation ? "translate-x-4" : "translate-x-0"
+                  }`}
+                />
+              </button>
+              <span className="text-xs text-neutral-400">
+                Skip segmentation&nbsp;
+                <span className="text-neutral-600">(use for single-clip files)</span>
+              </span>
+            </div>
           </div>
 
           {/* Input slots */}
@@ -402,19 +460,58 @@ export default function FileBrowser({ onComplete, fcpxmlPath, onFcpxmlSelected }
         <>
           <div className="mb-8">
             <h2 className="text-2xl font-bold mb-1">Transcribing</h2>
-            <p className="text-neutral-400 text-sm">Deepgram nova-3 · word-level timestamps · speaker diarization</p>
+            <p className="text-neutral-400 text-sm">
+              {isStereo
+                ? "Stereo file — each channel sent to Deepgram separately for precise speaker identification."
+                : "Deepgram nova-3 · word-level timestamps · speaker diarization"}
+            </p>
           </div>
 
-          <div className="rounded-xl border border-neutral-800 bg-neutral-900/30 p-5 mb-4">
-            <div className="flex items-center gap-3 mb-3">
-              <div className={`w-2.5 h-2.5 rounded-full shrink-0 ${txStatus === "done" ? "bg-green-500" : txStatus === "error" ? "bg-red-500" : "bg-violet-500 animate-pulse"}`} />
-              <span className="text-sm text-neutral-200 flex-1">{txStatusText}</span>
+          {isStereo ? (
+            <>
+              <div className="flex gap-4 mb-4">
+                {/* Left channel card */}
+                {[
+                  { label: "Left Channel", role: "Host", state: leftChState },
+                  { label: "Right Channel", role: "Caller", state: rightChState },
+                ].map(({ label, role, state }) => (
+                  <div key={label} className="flex-1 rounded-xl border border-neutral-800 bg-neutral-900/50 p-5">
+                    <div className="flex items-center justify-between mb-3">
+                      <span className="text-xs text-neutral-500 uppercase tracking-wider font-medium">{label}</span>
+                      {state === "done" && <span className="text-xs text-green-400 font-medium">✓ Done</span>}
+                    </div>
+                    <p className="text-base font-semibold text-white mb-4">{role}</p>
+                    <div className="flex items-center gap-2">
+                      <div className={`w-2.5 h-2.5 rounded-full shrink-0 ${
+                        state === "done" ? "bg-green-500" :
+                        state === "transcribing" ? "bg-blue-500 animate-pulse" :
+                        state === "extracting" ? "bg-yellow-500 animate-pulse" :
+                        "bg-neutral-700"
+                      }`} />
+                      <span className="text-sm text-neutral-400">
+                        {state === "done" ? "Done" :
+                         state === "transcribing" ? "Transcribing..." :
+                         state === "extracting" ? "Extracting..." :
+                         "Waiting"}
+                      </span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <Progress value={txProgress} className="h-1.5 mb-4" />
+            </>
+          ) : (
+            <div className="rounded-xl border border-neutral-800 bg-neutral-900/30 p-5 mb-4">
+              <div className="flex items-center gap-3 mb-3">
+                <div className={`w-2.5 h-2.5 rounded-full shrink-0 ${txStatus === "done" ? "bg-green-500" : txStatus === "error" ? "bg-red-500" : "bg-violet-500 animate-pulse"}`} />
+                <span className="text-sm text-neutral-200 flex-1">{txStatusText}</span>
+              </div>
+              {txStatus !== "error" && <Progress value={txProgress} className="h-1.5" />}
+              {txStatus === "error" && txError && (
+                <div className="text-red-400 text-sm mt-2 p-3 bg-red-950/20 border border-red-900/30 rounded-lg">{txError}</div>
+              )}
             </div>
-            {txStatus !== "error" && <Progress value={txProgress} className="h-1.5" />}
-            {txStatus === "error" && txError && (
-              <div className="text-red-400 text-sm mt-2 p-3 bg-red-950/20 border border-red-900/30 rounded-lg">{txError}</div>
-            )}
-          </div>
+          )}
 
           {/* Input summary */}
           <div className="grid grid-cols-2 gap-3 text-xs text-neutral-500">
@@ -458,7 +555,7 @@ export default function FileBrowser({ onComplete, fcpxmlPath, onFcpxmlSelected }
               </p>
             </div>
             <Button
-              onClick={() => onComplete(transcript, duration, fps, videoPath, segments)}
+              onClick={() => onComplete(transcript, duration, fps, videoPath, segments, isStereo || undefined)}
               className="shrink-0 bg-violet-600 text-white hover:bg-violet-500 font-semibold ml-4"
             >
               LLM Edit →

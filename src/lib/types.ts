@@ -61,13 +61,4 @@ export interface EditableWord {
 export type SpeakerMap = Record<number, string>;
 
 // App step flow
-export type AppStep = "browse" | "transcribe" | "segment" | "prompt" | "edit" | "export";
-
-// Full in-memory app state
-export interface ClipperState {
-  filePath: string;
-  fileName: string;
-  transcript: TranscriptEntry[];
-  duration: number;
-  segments: SegmentGroup[];
-}
+export type AppStep = "browse" | "prompt" | "edit" | "export";
